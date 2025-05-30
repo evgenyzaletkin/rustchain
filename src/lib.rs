@@ -5,11 +5,17 @@ use std::sync::mpsc;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
-mod transactions;
+pub mod transactions;
 
 #[derive(Clone, Eq, PartialEq, Hash, Copy, Debug, Display)]
 pub struct PeerId {
     id: u32,
+}
+
+impl PeerId {
+    pub fn new(id: u32) -> PeerId {
+        PeerId { id }
+    }
 }
 
 pub struct Peer {
