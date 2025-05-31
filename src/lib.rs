@@ -1,14 +1,21 @@
-use std::any::Any;
+use crate::transactions::{Transaction, TransactionProcessor};
+use derive_more::Display;
 use std::collections::HashMap;
 use std::sync::mpsc;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
-use derive_more::Display;
 
-#[derive(Clone, Eq, PartialEq, Hash, Copy, Debug)]
-#[derive(Display)]
+pub mod transactions;
+
+#[derive(Clone, Eq, PartialEq, Hash, Copy, Debug, Display)]
 pub struct PeerId {
     id: u32,
+}
+
+impl PeerId {
+    pub fn new(id: u32) -> PeerId {
+        PeerId { id }
+    }
 }
 
 pub struct Peer {
@@ -17,16 +24,19 @@ pub struct Peer {
     last_ping_times: HashMap<PeerId, Instant>,
     last_response_times: HashMap<PeerId, Instant>,
     receiver: Receiver<Message>,
+    transaction_processor: TransactionProcessor,
 }
 
 #[derive(Display)]
 enum MessageBody {
-    PING,
-    PONG,
+    Ping,
+    Pong,
+    #[display("Transaction")]
+    Transaction(Transaction),
 }
 
 #[derive(Display)]
-#[display("{from} -> {to} {body}")]
+#[display("{from} -> {to} ")]
 pub struct Message {
     from: PeerId,
     to: PeerId,
@@ -66,6 +76,7 @@ impl Peer {
             last_response_times: HashMap::new(),
             last_ping_times: HashMap::new(),
             receiver,
+            transaction_processor: TransactionProcessor::new(PeerId { id }),
         }
     }
 
@@ -77,7 +88,7 @@ impl Peer {
         network.send(Message {
             from: self.id.clone(),
             to,
-            body: MessageBody::PING,
+            body: MessageBody::Ping,
         });
     }
 
@@ -99,14 +110,17 @@ impl Peer {
         self.last_response_times
             .insert(message.from, Instant::now());
         match message.body {
-            MessageBody::PING => {
+            MessageBody::Transaction(transaction) => {
+                self.transaction_processor.process_transaction(transaction)
+            }
+            MessageBody::Ping => {
                 network.send(Message {
                     from: self.id,
                     to: message.from,
-                    body: MessageBody::PONG,
+                    body: MessageBody::Pong,
                 });
             }
-            MessageBody::PONG => {}
+            MessageBody::Pong => {}
         }
     }
 
