@@ -3,16 +3,17 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
 
-    use ::rustchain::transactions::{AssetType, BlockKeeper, Metadata, Operation, Transaction};
-    use rustchain::transactions::TransactionProcessor;
+    use ::rustchain::transactions::{
+        AssetType, Metadata, Operation, Transaction, TransactionProcessor,
+    };
+    use rustchain::storage::BlockKeeper;
 
     #[test]
     fn account_state_should_be_restored_from_saved_blocks() {
         let path_to_blocks = PathBuf::from("target/test/data/peer_1");
-        fs::remove_dir_all(&path_to_blocks).expect("Failed to remove directory");
+        fs::remove_dir_all(&path_to_blocks);
         fs::create_dir_all(&path_to_blocks).expect("Failed to create directory");
-        let block_keeper = BlockKeeper::new(path_to_blocks.clone(), 3);
-        let mut transaction_processor = TransactionProcessor::with_block_keeper(block_keeper);
+        let mut block_keeper = BlockKeeper::new(path_to_blocks.clone(), 3);
 
         let transaction1 = Transaction {
             operation: Operation::AddCoin {
@@ -31,14 +32,13 @@ mod tests {
         transaction2.public_key = "public_key2".to_string();
         let transaction3 = transaction1.clone();
 
-        transaction_processor.process_transaction(transaction1);
-        transaction_processor.process_transaction(transaction2);
-        transaction_processor.process_transaction(transaction3);
-        validate_accounts(&transaction_processor);
+        block_keeper.add_transaction(transaction1);
+        block_keeper.add_transaction(transaction2);
+        block_keeper.add_transaction(transaction3);
+        let block_keeper = BlockKeeper::new(path_to_blocks, 3);
 
-        let mut transaction_processor =
-            TransactionProcessor::with_block_keeper(BlockKeeper::new(path_to_blocks, 3));
-        transaction_processor.read_state();
+        let mut transaction_processor = TransactionProcessor::new();
+        transaction_processor.read_state(&block_keeper);
         validate_accounts(&transaction_processor);
     }
 

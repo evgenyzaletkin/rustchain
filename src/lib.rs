@@ -1,21 +1,17 @@
 use crate::transactions::{Transaction, TransactionProcessor};
-use derive_more::Display;
+use derive_more::{Constructor, Display};
 use std::collections::HashMap;
 use std::sync::mpsc;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
+use derive_more::with_trait::From;
 
 pub mod transactions;
+pub mod storage;
 
-#[derive(Clone, Eq, PartialEq, Hash, Copy, Debug, Display)]
+#[derive(Clone, Eq, PartialEq, Hash, Copy, Debug, Display, From, Constructor)]
 pub struct PeerId {
     id: u32,
-}
-
-impl PeerId {
-    pub fn new(id: u32) -> PeerId {
-        PeerId { id }
-    }
 }
 
 pub struct Peer {
@@ -76,7 +72,7 @@ impl Peer {
             last_response_times: HashMap::new(),
             last_ping_times: HashMap::new(),
             receiver,
-            transaction_processor: TransactionProcessor::new(PeerId { id }),
+            transaction_processor: TransactionProcessor::new(),
         }
     }
 
