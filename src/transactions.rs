@@ -1,10 +1,7 @@
 use crate::storage::BlockKeeper;
-use derive_more::Constructor;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-const DEFAULT_MEMPOOL_SIZE: usize = 100;
-const DEFAULT_PATH_TO_BLOCKS: &str = "data";
 
 #[derive(Serialize, Deserialize, Eq, PartialEq, Clone)]
 pub struct Metadata {
@@ -51,7 +48,7 @@ pub struct TransactionProcessor {
 }
 
 impl TransactionProcessor {
-    
+
     pub fn new() -> Self {
         Self {
             accounts: HashMap::new(),
@@ -96,7 +93,7 @@ impl TransactionProcessor {
     }
 
     pub fn read_state(&mut self, block_keeper: &BlockKeeper) {
-        let block_names = block_keeper.list_all_blocks();
+        let block_names = block_keeper.list_all_blocks_sorted();
         for block_name in block_names {
             let transactions = block_keeper.read_transactions_from_disk(&block_name);
             for transaction in transactions {
