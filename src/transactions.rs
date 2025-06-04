@@ -1,11 +1,39 @@
-use crate::storage::BlockKeeper;
+use crate::crypto::Signable;
+use crate::storage::{BlockKeeper, KeyManager};
+use hex::FromHex;
+use k256::ecdsa::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-
+//
+// #[derive(Eq, PartialEq, Clone)]
+// pub struct Signature([u8; 64]);
+//
+// impl Serialize for Signature {
+//     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+//     where
+//         S: serde::Serializer,
+//     {
+//         serializer.serialize_bytes(&self.0)
+//     }
+// }
+//
+// impl<'de> Deserialize<'de> for Signature {
+//     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+//     where
+//         D: serde::Deserializer<'de>,
+//     {
+//         let hex_str = String::deserialize(deserializer)?;
+//         let bytes = Vec::from_hex(hex_str)
+//             .map_err(|e| serde::de::Error::custom(format!("Hex decode error: {}", e)))?
+//             .try_into()
+//             .map_err(|_| serde::de::Error::custom("Invalid signature length"))?;
+//         Ok(Signature(bytes))
+//     }
+// }
 
 #[derive(Serialize, Deserialize, Eq, PartialEq, Clone)]
 pub struct Metadata {
-    pub timestamp_nanos: u32,
+    pub timestamp_nanos: u128,
     pub sequence_number: u32,
 }
 
@@ -31,40 +59,45 @@ pub enum Operation {
 #[derive(Serialize, Deserialize, Eq, PartialEq, Clone)]
 pub struct Transaction {
     pub operation: Operation,
-    pub signature: String,
-    pub public_key: String,
+    pub signature: Signature,
+    pub public_key: VerifyingKey,
     pub metadata: Metadata,
 }
+
+impl Signable for Transaction {}
+impl Signable for Operation {}
 
 pub struct Account {
     pub asset_type: AssetType,
     pub balance: u32,
 }
 
-
-
+#[derive(Default)]
 pub struct TransactionProcessor {
     accounts: HashMap<String, Account>,
 }
 
 impl TransactionProcessor {
 
-    pub fn new() -> Self {
-        Self {
-            accounts: HashMap::new(),
-        }
-    }
-
     pub fn process_transaction(&mut self, transaction: Transaction) {
         match transaction.operation {
             Operation::AddCoin { asset_type, amount } => {
-                self.add_coin(transaction.public_key.clone(), asset_type.clone(), amount);
+                self.add_coin(
+                    KeyManager::to_string_hex(&transaction.public_key),
+                    asset_type.clone(),
+                    amount,
+                );
             }
             Operation::Send {
                 recipient,
                 amount,
                 asset_type,
-            } => self.send_coins(transaction.public_key, recipient, asset_type, amount),
+            } => self.send_coins(
+                KeyManager::to_string_hex(&transaction.public_key),
+                recipient,
+                asset_type,
+                amount,
+            ),
         }
     }
 
@@ -93,7 +126,7 @@ impl TransactionProcessor {
     }
 
     pub fn read_state(&mut self, block_keeper: &BlockKeeper) {
-        let block_names = block_keeper.list_all_blocks_sorted();
+        let block_names = block_keeper.list_all_blocks();
         for block_name in block_names {
             let transactions = block_keeper.read_transactions_from_disk(&block_name);
             for transaction in transactions {
@@ -102,7 +135,3 @@ impl TransactionProcessor {
         }
     }
 }
-
-
-
-

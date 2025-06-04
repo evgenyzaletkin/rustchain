@@ -1,5 +1,6 @@
-use rustchain::{Network, Peer};
-use std::sync::{Arc, mpsc};
+use rustchain::network::Network;
+use rustchain::Peer;
+use std::sync::{mpsc, Arc};
 use std::thread;
 
 fn main() {

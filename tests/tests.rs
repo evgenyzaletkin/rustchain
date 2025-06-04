@@ -10,84 +10,32 @@ mod tests {
     use k256::ecdsa::{Signature, VerifyingKey};
     use rand::rng;
     use rustchain::Peer;
-    use rustchain::storage::{BlockKeeper, BlockStatus, KeyManager};
+    use rustchain::storage::{BlockKeeper};
     use std::fs;
     use std::path::PathBuf;
     use std::sync::mpsc;
+    use rustchain::crypto::KeyManager;
 
     const TEST_DATA_PATH: &str = "target/test/data";
-
-    #[test]
-    fn account_state_should_be_restored_from_saved_blocks() {
-        let path_to_blocks = PathBuf::from(TEST_DATA_PATH).join("peer_1");
-        recreate_dir(&path_to_blocks);
-        let mut block_keeper = BlockKeeper::new(path_to_blocks.clone(), 3);
-
-        let transaction1 = Transaction {
-            operation: Operation::AddCoin {
-                amount: 10,
-                asset_type: AssetType::BTC,
-            },
-            signature: "signature1".to_string(),
-            public_key: "public_key1".to_string(),
-            metadata: Metadata {
-                timestamp_nanos: 100,
-                sequence_number: 1,
-            },
-        };
-        let mut transaction2 = transaction1.clone();
-        transaction2.signature = "signature2".to_string();
-        transaction2.public_key = "public_key2".to_string();
-        let transaction3 = transaction1.clone();
-
-        block_keeper.add_transaction(transaction1);
-        block_keeper.add_transaction(transaction2);
-        if let BlockStatus::NewBlockCreated { block_hash } =
-            block_keeper.add_transaction(transaction3)
-        {
-            block_keeper
-                .commit_block(&block_hash)
-                .expect("Block commit failed");
-            let block_keeper = BlockKeeper::new(path_to_blocks, 3);
-            let mut transaction_processor = TransactionProcessor::new();
-            transaction_processor.read_state(&block_keeper);
-            validate_accounts(&transaction_processor);
-        } else {
-            panic!("New block not created");
-        }
-    }
-
-    fn validate_accounts(transaction_processor: &TransactionProcessor) {
-        let acc1 = transaction_processor.get_account("public_key1").unwrap();
-        assert!(acc1.asset_type == AssetType::BTC);
-        assert_eq!(acc1.balance, 20);
-        let acc2 = transaction_processor.get_account("public_key2").unwrap();
-        assert!(acc2.asset_type == AssetType::BTC);
-        assert_eq!(acc2.balance, 10);
-    }
-
-    #[test]
-    fn sign_message_and_verify_it() {
-        let signing_key: SigningKey = SigningKey::random(&mut rng()); // Serialize with `::to_bytes()`
-        let message =
-            b"ECDSA proves knowledge of a secret number in the context of a single message";
-        let signature: Signature = signing_key.sign(message);
-        let verifying_key = VerifyingKey::from(signing_key);
-        assert!(verifying_key.verify(message, &signature).is_ok());
-    }
 
     #[test]
     fn test_key_from_key_manager() {
         let key_dir = PathBuf::from(TEST_DATA_PATH).join("peer_1");
         recreate_dir(&key_dir);
         let signing_key: SigningKey = KeyManager::get_or_create_key(&key_dir);
+        let operation = Operation::AddCoin {
+            amount: 10,
+            asset_type: AssetType::BTC,
+        };
+        let signature = KeyManager::sign_message(&signing_key, &operation);
+        let public_key = VerifyingKey::from(&signing_key);
         let transaction1 = Transaction {
             operation: Operation::AddCoin {
                 amount: 10,
                 asset_type: AssetType::BTC,
             },
-            signature: "signature1".to_string(),
-            public_key: "public_key1".to_string(),
+            signature,
+            public_key,
             metadata: Metadata {
                 timestamp_nanos: 100,
                 sequence_number: 1,

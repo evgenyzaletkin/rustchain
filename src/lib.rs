@@ -1,17 +1,20 @@
-use crate::storage::{BlockFile, BlockStatus, KeyManager};
+use crate::network::Network;
+use crate::storage::{BlockHash, BlockStatus, KeyManager};
 use derive_more::with_trait::From;
 use derive_more::{Constructor, Display};
-use k256::ecdsa::signature::Signer;
+use k256::ecdsa::signature::{Signer, Verifier};
 use k256::ecdsa::{Signature, SigningKey, VerifyingKey};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::Deref;
 use std::path::PathBuf;
-use std::sync::mpsc::{Receiver, Sender};
-use std::sync::{Arc, mpsc};
+use std::sync::mpsc;
+use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 use storage::BlockKeeper;
 use transactions::{Transaction, TransactionProcessor};
 
+pub mod crypto;
+pub mod network;
 pub mod storage;
 pub mod transactions;
 
@@ -20,6 +23,8 @@ pub struct PeerId {
     id: u32,
 }
 
+pub type TxPayload = Vec<u8>;
+
 #[derive(Display, Clone)]
 pub enum MessageBody {
     Ping,
@@ -27,18 +32,29 @@ pub enum MessageBody {
     #[display("Transaction")]
     ClientTransaction(Transaction),
     #[display("Transaction")]
-    NotifyTransaction {
+    Synchronization {
         // for broadcasting
-        transaction: Arc<Transaction>,
+        transaction: TxPayload,
+        signature: Signature,
+        public_key: VerifyingKey,
     },
     #[display("BlockProposal")]
     BlockProposal {
         // for broadcasting
-        block_file: Arc<BlockFile>,
-        signature: String,
-        public_key: String,
+        block_hash: BlockHash,
+        block_file: Vec<u8>,
+        signature: Signature,
+        public_key: VerifyingKey,
     },
-    BlockVote,
+    #[display("BlockReject")]
+    BlockReject {
+        block_hash: BlockHash,
+    },
+    #[display("BlockReject")]
+    BlockApproved {
+        // TODO add singature and public key
+        block_hash: BlockHash,
+    },
 }
 
 #[derive(Display)]
@@ -49,42 +65,48 @@ pub struct Message {
     body: MessageBody,
 }
 
-#[derive(Default)]
-pub struct Network {
-    senders: HashMap<PeerId, Sender<Message>>,
+struct Consensus {
+    participants: HashSet<PeerId>,
+    approvals: HashSet<PeerId>,
+    rejections: HashSet<PeerId>,
 }
 
-impl Network {
-    fn send(&self, message: Message) {
-        if let Some(sender) = self.senders.get(&message.to) {
-            sender.send(message).expect("Failed to send message");
-        } else {
-            println!(
-                "Warning: Attempted to send message to unknown peer {:?}",
-                message.to
-            );
-        }
-    }
-
-    pub fn add_peer(&mut self, peer_id: PeerId, sender: Sender<Message>) {
-        self.senders.insert(peer_id, sender);
-    }
-}
-
-struct Voting {
-    participants: Vec<PeerId>,
-    approvals: Vec<PeerId>,
-    rejections: Vec<PeerId>,
-}
-
-impl Voting {
-    fn new(participants: Vec<PeerId>) -> Voting {
-        Voting {
-            approvals: Vec::with_capacity(participants.len()),
-            rejections: Vec::with_capacity(participants.len()),
+impl Consensus {
+    fn new(peer_id: PeerId, known_peers: &Vec<PeerId>) -> Consensus {
+        let mut participants: HashSet<PeerId> = HashSet::from_iter(known_peers.clone());
+        participants.insert(peer_id);
+        let mut approvals = HashSet::with_capacity(participants.len());
+        approvals.insert(peer_id);
+        Consensus {
+            approvals,
+            rejections: HashSet::with_capacity(participants.len()),
             participants,
         }
     }
+
+    fn make_vote(&mut self, peer_id: PeerId, approve: bool) -> ConsensusResult {
+        if (self.participants.contains(&peer_id)) {
+            if approve {
+                self.approvals.insert(peer_id);
+            } else {
+                self.rejections.insert(peer_id);
+            }
+            let total_peers = self.participants.len();
+            let f = (total_peers - 1) / 3;
+            if self.approvals.len() >= 2 * f + 1 {
+                return ConsensusResult::Approved;
+            } else if self.rejections.len() >= f {
+                return ConsensusResult::Rejected;
+            }
+        }
+        ConsensusResult::InProgress
+    }
+}
+
+enum ConsensusResult {
+    InProgress,
+    Approved,
+    Rejected,
 }
 
 pub struct Peer {
@@ -95,7 +117,7 @@ pub struct Peer {
     receiver: Receiver<Message>,
     transaction_processor: TransactionProcessor,
     block_keeper: BlockKeeper,
-    votings: HashMap<String, Voting>,
+    votings: HashMap<BlockHash, Consensus>,
     signing_key: SigningKey,
     public_key: VerifyingKey,
 }
@@ -114,7 +136,7 @@ impl Peer {
             last_response_times: HashMap::new(),
             last_ping_times: HashMap::new(),
             receiver,
-            transaction_processor: TransactionProcessor::new(),
+            transaction_processor: TransactionProcessor::default(),
             signing_key,
             public_key,
             block_keeper: BlockKeeper::new(peer_dir, storage::DEFAULT_MEMPOOL_SIZE),
@@ -136,7 +158,7 @@ impl Peer {
             last_response_times: HashMap::new(),
             last_ping_times: HashMap::new(),
             receiver,
-            transaction_processor: TransactionProcessor::new(),
+            transaction_processor: TransactionProcessor::default(),
             signing_key,
             public_key,
             block_keeper,
@@ -173,7 +195,7 @@ impl Peer {
         println!("Received message: {message}");
         self.last_response_times
             .insert(message.from, Instant::now());
-        match message.body {
+        if let Err(e) = match message.body {
             MessageBody::ClientTransaction(transaction) => {
                 self.process_client_transaction(transaction, network)
             }
@@ -183,90 +205,205 @@ impl Peer {
                     to: message.from,
                     body: MessageBody::Pong,
                 });
+                Ok(())
             }
-            MessageBody::Pong => {}
-            MessageBody::NotifyTransaction { transaction } => {
-                self.process_transaction_notification(transaction, network)
-            }
+            MessageBody::Pong => Ok(()),
+            MessageBody::Synchronization {
+                transaction,
+                signature,
+                public_key,
+            } => self.synchronize_transaction(
+                message.from,
+                transaction,
+                signature,
+                public_key,
+                network,
+            ),
             MessageBody::BlockProposal {
-                block_file: _,
-                signature: _,
-                public_key: _,
-            } => {}
-            MessageBody::BlockVote => {}
+                block_hash,
+                block_file,
+                signature,
+                public_key,
+            } => {
+                self.process_block_proposal(block_hash, block_file, signature, public_key, network)
+            }
+            MessageBody::BlockApproved { block_hash } => {
+                Err("Block approved is not supported yet".to_string())
+            }
+            MessageBody::BlockReject { block_hash } => {
+                Err("Block reject is not supported yet".to_string())
+            }
+        } {
+            eprintln!("Failed to process message: {e}");
         }
     }
 
-    fn process_client_transaction(&mut self, transaction: Transaction, network: &Network) {
-        // let's keep two methods for now, since the logic for client and notification transaction
-        // might be different in the future
-        // For now, only Arc
-        self.process_transaction_general(Arc::new(transaction), network);
-    }
-
-    fn process_transaction_notification(
+    fn process_client_transaction(
         &mut self,
-        transaction: Arc<Transaction>,
+        transaction: Transaction,
         network: &Network,
-    ) {
-        self.process_transaction_general(transaction, network);
+    ) -> Result<(), String> {
+        self.transaction_processor
+            .process_transaction(transaction.clone());
+        let status = self.block_keeper.add_transaction(transaction.clone());
+        self.broadcast_transaction(network, &transaction)?;
+        if let BlockStatus::NewBlockCreated { block_hash } = status {
+            self.broadcast_block_proposal(network, block_hash)?
+        }
+        Ok(())
     }
 
-    fn process_transaction_general(&mut self, transaction: Arc<Transaction>, network: &Network) {
-        self.transaction_processor
-            .process_transaction(transaction.deref().clone());
-        let status = self
-            .block_keeper
-            .add_transaction(transaction.deref().clone());
-        self.broadcast_message(
-            network,
-            MessageBody::NotifyTransaction {
-                transaction: transaction.clone(),
-            },
-        );
-        if let BlockStatus::NewBlockCreated { block_hash } = status {
-            if (!self.known_peers.is_empty()) {
-                if let Some(block_file) = self.block_keeper.get_uncommited_block(&block_hash) {
-                    let block_string =
-                        serde_json::to_string(&block_file).expect("Failed to serialize block file");
-                    let signature: Signature = self.signing_key.sign(block_string.as_bytes());
-                    self.broadcast_message(
-                        network,
-                        MessageBody::BlockProposal {
-                            block_file: Arc::new(block_file.clone()),
-                            signature: signature.to_string(),
-                            public_key: KeyManager::key_to_hex_string(&self.public_key),
-                        },
-                    )
+    fn synchronize_transaction(
+        &mut self,
+        from: PeerId,
+        transaction_bytes: Vec<u8>,
+        signature: Signature,
+        public_key: VerifyingKey,
+        network: &Network,
+    ) -> Result<(), String> {
+        match KeyManager::verify_message(&public_key, &signature, &transaction_bytes) {
+            Ok(_) => {
+                let Some(transaction) =
+                    serde_json::from_slice::<Transaction>(&transaction_bytes).ok()
+                else {
+                    return Err("Failed to deserialize transaction".to_string());
+                };
+
+                if let BlockStatus::NewBlockCreated { block_hash } =
+                    self.block_keeper.add_transaction(transaction.clone())
+                {
+                    self.broadcast_block_proposal(network, block_hash)?
                 }
-                self.votings.insert(
-                    block_hash.to_string(),
-                    Voting::new(self.known_peers.clone()),
-                );
-            } else {
-                self.block_keeper
-                    .commit_block(&block_hash)
-                    .expect("Failed to commit block");
+                // for now and for simplicity, we don't broadcast transaction processed by other peer
+                // else {
+                //     self.broadcast_transaction(network, &transaction);
+                // }
+
+                Ok(())
             }
+            Err(e) => {
+                // Add peer to blacklist
+                Err(format!(
+                    "Failed to verify message from peer {:?}: {:?}",
+                    from, e
+                ))
+            }
+        }
+    }
+
+    fn broadcast_transaction(
+        &mut self,
+        network: &Network,
+        transaction: &Transaction,
+    ) -> Result<(), String> {
+        let transaction_bytes = serde_json::to_vec(&transaction)
+            .map_err(|e| format!("Failed to serialize transaction: {}", e))?;
+        let signature: Signature = self.signing_key.sign(&transaction_bytes);
+        network.broadcast(
+            &MessageBody::Synchronization {
+                transaction: transaction_bytes,
+                signature,
+                public_key: self.public_key,
+            },
+            self.id,
+            &self.known_peers,
+        );
+        Ok(())
+    }
+
+    fn broadcast_block_proposal(
+        &mut self,
+        network: &Network,
+        block_hash: BlockHash,
+    ) -> Result<(), String> {
+        if (!self.known_peers.is_empty()) {
+            if let Some(block_file) = self.block_keeper.get_uncommited_block(&block_hash) {
+                let block_as_bytes =
+                    serde_json::to_vec(&block_file).expect("Failed to serialize block file");
+                let signature: Signature = self.signing_key.sign(&block_as_bytes);
+                network.broadcast(
+                    &MessageBody::BlockProposal {
+                        block_hash,
+                        block_file: block_as_bytes,
+                        signature,
+                        public_key: self.public_key,
+                    },
+                    self.id,
+                    &self.known_peers,
+                )
+            }
+            self.votings
+                .insert(block_hash, Consensus::new(self.id, &self.known_peers));
+            Ok(())
+        } else {
+            self.block_keeper.commit_block(&block_hash)
         }
     }
 
     fn process_block_proposal(
-        block_file: Arc<BlockFile>,
-        signature: String,
-        public_key: String,
+        &mut self,
+        block_hash: BlockHash,
+        block_file: Vec<u8>,
+        signature: Signature,
+        public_key: VerifyingKey,
         network: &Network,
-    ) {
+    ) -> Result<(), String> {
+        // Verification Failed - send vote rejected
+        // Verification Succeeded and Result is Approved - commit block and send vote
+        // Verification Succeeded and Result is already voted - do nothing
+        // Verification Succeeded and Result is In Progress - send vote approved
+        let verification_result = self
+            .block_keeper
+            .verify_block(block_hash.clone(), block_file, signature, public_key)
+            .is_ok();
+        let message: MessageBody = if verification_result {
+            if let Some(consensus) = self.votings.get_mut(&block_hash) {
+                if let ConsensusResult::Approved = consensus.make_vote(self.id, true) {
+                    self.block_keeper.commit_block(&block_hash)?;
+                }
+                return Ok(());
+            } else {
+                self.votings.insert(
+                    block_hash,
+                    Consensus::new(self.id, &self.known_peers.clone()),
+                );
+                MessageBody::BlockApproved { block_hash }
+            }
+        } else {
+            MessageBody::BlockReject { block_hash }
+        };
+        network.broadcast(&message, self.id, &self.known_peers);
+        match self.update_consensus_and_get_result(
+            &block_hash,
+            &self.id.clone(),
+            verification_result,
+        ) {
+            ConsensusResult::Approved => {
+                self.block_keeper
+                    .commit_block(&block_hash)
+                    .expect("Failed to commit block");
+            }
+            ConsensusResult::Rejected => {
+                //             TODO Logic to remove block from uncommited and restore transactions to mempool
+            }
+            ConsensusResult::InProgress => {
+                //     Nothing to do here, just wait for more votes
+            }
+        }
+        Ok(())
     }
 
-    fn broadcast_message(&mut self, network: &Network, message_body: MessageBody) {
-        for to in &self.known_peers {
-            network.send(Message {
-                from: self.id.clone(),
-                to: to.clone(),
-                body: message_body.clone(),
-            })
-        }
+    fn update_consensus_and_get_result(
+        &mut self,
+        block_hash: &BlockHash,
+        voter_id: &PeerId,
+        approve: bool,
+    ) -> ConsensusResult {
+        let mut cons = self
+            .votings
+            .entry(*block_hash)
+            .or_insert_with_key(|_| Consensus::new(self.id, &self.known_peers.clone()));
+        cons.make_vote(*voter_id, approve)
     }
 
     fn disconnect_dead_peers(&mut self) {
@@ -315,8 +452,17 @@ impl Peer {
 
 #[cfg(test)]
 mod tests {
-    use crate::{Network, Peer};
+    use crate::crypto::KeyManager;
+    use crate::storage::BlockKeeper;
+    use crate::transactions::{AssetType, Metadata, Operation, Transaction};
+    use crate::{Message, MessageBody, Network, Peer, PeerId};
+    use k256::ecdsa::{SigningKey, VerifyingKey};
+    use std::fs;
+    use std::path::PathBuf;
     use std::sync::mpsc;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    const TEST_DATA_PATH: &str = "target/test/data";
 
     #[test]
     fn simple_test() {
@@ -333,5 +479,88 @@ mod tests {
         peer1.send_ping(peer2.id, &network);
         assert!(peer2.process_message(&network));
         assert!(peer1.process_message(&network));
+    }
+
+    #[test]
+    fn test_block_voting_between_2_peers() {
+        let (sender1, receiver1) = mpsc::channel();
+        let (sender2, receiver2) = mpsc::channel();
+        let peer_1_dir = PathBuf::from(TEST_DATA_PATH).join("peer_1");
+        let peer_2_dir = PathBuf::from(TEST_DATA_PATH).join("peer_2");
+        recreate_dir(&peer_1_dir);
+        recreate_dir(&peer_2_dir);
+        let mut peer1 = Peer::create_with_storage(
+            1,
+            receiver1,
+            peer_1_dir.clone(),
+            BlockKeeper::new(peer_1_dir.clone(), 1),
+        );
+        let mut peer2 = Peer::create_with_storage(
+            2,
+            receiver2,
+            peer_2_dir.clone(),
+            BlockKeeper::new(peer_2_dir.clone(), 1),
+        );
+        peer1.connect_with_peer(peer2.id);
+        peer2.connect_with_peer(peer1.id);
+        let mut network = Network::default();
+        network.add_peer(peer1.id, sender1);
+        network.add_peer(peer2.id, sender2);
+
+        let operation = Operation::AddCoin {
+            asset_type: AssetType::USDT,
+            amount: 10,
+        };
+        let client_key = KeyManager::create_key();
+
+        let client_msg = Message {
+            from: PeerId::from(0),
+            to: peer1.id.clone(),
+            body: MessageBody::ClientTransaction(create_client_transaction(operation, &client_key)),
+        };
+        network.send(client_msg);
+        assert!(
+            peer1.process_message(&network),
+            "Peer 1 failed to process client message"
+        );
+        assert!(
+            peer2.process_message(&network),
+            "Peer 2 failed to process block proposal message"
+        );
+
+        assert!(
+            peer1.process_message(&network),
+            "Peer 2 failed to process block approved message"
+        );
+
+        let commited_blocks = peer1.block_keeper.list_all_blocks();
+        assert_eq!(1, commited_blocks.len());
+    }
+
+    fn create_client_transaction(operation: Operation, signing_key: &SigningKey) -> Transaction {
+        let client_key = KeyManager::create_key();
+        let public_key = VerifyingKey::from(&client_key);
+        let operation = Operation::AddCoin {
+            asset_type: AssetType::USDT,
+            amount: 10,
+        };
+        let signature = KeyManager::sign_message(&client_key, &operation);
+        Transaction {
+            operation,
+            signature,
+            public_key,
+            metadata: Metadata {
+                timestamp_nanos: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+                sequence_number: 1,
+            },
+        }
+    }
+
+    fn recreate_dir(path: &PathBuf) {
+        fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).expect("Failed to create directory");
     }
 }
