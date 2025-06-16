@@ -9,25 +9,39 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sorted_vec::SortedVec;
 use std::collections::HashMap;
+use std::fmt::{Display, Formatter};
 use std::path::PathBuf;
 use std::sync::LazyLock;
-use std::{fs, mem};
+use std::{fmt, fs, mem};
 
 pub const DEFAULT_PATH_TO_BLOCKS: &str = "data";
 pub const DEFAULT_MEMPOOL_SIZE: usize = 100;
-pub const EMPTY_HASH: BlockHash = [0; 32];
+pub const EMPTY_HASH: BlockHash = BlockHash([0; 32]);
 
-pub struct BlockKeeper {
-    path_to_blocks: PathBuf,
-    mempool_size: usize,
-    mempool: Vec<Transaction>,
-    uncommited_blocks: HashMap<BlockHash, BlockFile>,
-    last_commited_index: u32,
-    last_commited_hash: BlockHash,
-    previous_hash: BlockHash,
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub struct BlockHash([u8; 32]);
+
+impl BlockHash {
+    pub fn new(hash: [u8; 32]) -> Self {
+        Self(hash)
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
 }
 
-pub type BlockHash = [u8; 32];
+impl From<[u8; 32]> for BlockHash {
+    fn from(hash: [u8; 32]) -> Self {
+        Self(hash)
+    }
+}
+
+impl Display for BlockHash {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", hex::encode(self.0))
+    }
+}
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct BlockFile {
@@ -63,6 +77,17 @@ impl From<serde_json::Error> for BlockVerificationError {
     }
 }
 
+pub struct BlockKeeper {
+    path_to_blocks: PathBuf,
+    mempool_size: usize,
+    mempool: HashMap<String, Transaction>,
+    pending_transactions: HashMap<String, Transaction>,
+    uncommited_blocks: HashMap<BlockHash, BlockFile>,
+    last_commited_index: u32,
+    last_commited_hash: BlockHash,
+    previous_hash: BlockHash,
+}
+
 impl BlockKeeper {
     const BLOCK_PATTERN: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"^(\d+)\.block$").expect("invalid regex"));
@@ -71,7 +96,8 @@ impl BlockKeeper {
         let mut keeper = Self {
             path_to_blocks,
             mempool_size,
-            mempool: Vec::with_capacity(mempool_size),
+            mempool: HashMap::with_capacity(mempool_size),
+            pending_transactions: HashMap::new(),
             uncommited_blocks: HashMap::new(),
             last_commited_index: 0,
             last_commited_hash: EMPTY_HASH,
@@ -96,10 +122,10 @@ impl BlockKeeper {
     }
 
     pub fn add_transaction(&mut self, transaction: Transaction) -> BlockStatus {
-        self.mempool.push(transaction);
+        self.mempool.insert(transaction.tx_id(), transaction);
         if (self.mempool.len() >= self.mempool_size) {
             let transactions =
-                mem::replace(&mut self.mempool, Vec::with_capacity(self.mempool_size));
+                mem::replace(&mut self.mempool, HashMap::with_capacity(self.mempool_size));
             BlockStatus::NewBlockCreated {
                 block_hash: self.create_new_block(transactions),
             }
@@ -108,8 +134,9 @@ impl BlockKeeper {
         }
     }
 
-    fn create_new_block(&mut self, transactions: Vec<Transaction>) -> BlockHash {
-        let current_hash = Self::calculate_hash(&self.mempool, &self.previous_hash);
+    fn create_new_block(&mut self, transactions_map: HashMap<String, Transaction>) -> BlockHash {
+        let transactions: Vec<Transaction> = transactions_map.values().cloned().collect();
+        let current_hash = Self::calculate_hash(&transactions, &self.previous_hash);
         let block_file = BlockFile {
             transactions,
             current_hash: current_hash.clone(),
@@ -118,15 +145,36 @@ impl BlockKeeper {
         self.previous_hash = current_hash.clone();
         self.uncommited_blocks
             .insert(current_hash.clone(), block_file);
+        for transaction in transactions_map {
+            self.pending_transactions
+                .insert(transaction.0, transaction.1);
+        }
         current_hash
+    }
+
+    // Assume the block is already verified
+    pub fn add_block_from_proposal(&mut self, block_file: BlockFile) -> Result<(), String> {
+        if (self
+            .uncommited_blocks
+            .contains_key(&block_file.current_hash))
+        {
+            return Err(format!(
+                "Block with hash {} already exists",
+                block_file.current_hash
+            ));
+        }
+        for transaction in block_file.transactions {
+            if let Some(transaction) = self.mempool.remove(&transaction.tx_id()) {
+                self.pending_transactions
+                    .insert(transaction.tx_id(), transaction);
+            }
+        }
+        Ok(())
     }
 
     pub fn commit_block(&mut self, block_hash: &BlockHash) -> Result<(), String> {
         let Some(block_file) = self.uncommited_blocks.get(block_hash) else {
-            return Err(format!(
-                "Block with hash {} not found",
-                hex::encode(block_hash)
-            ));
+            return Err(format!("Block with hash {} not found", block_hash));
         };
         let block_index = self.last_commited_index + 1;
         let block_filename = self.block_filename_for_index(self.last_commited_index + 1);
@@ -136,6 +184,9 @@ impl BlockKeeper {
             Ok(_) => {
                 self.last_commited_index = block_index;
                 self.last_commited_hash = block_hash.clone();
+                for transaction in &block_file.transactions {
+                    self.pending_transactions.remove(&transaction.tx_id());
+                }
                 self.uncommited_blocks.remove(block_hash);
                 Ok(())
             }
@@ -143,18 +194,27 @@ impl BlockKeeper {
         }
     }
 
+    pub fn rollback_block(&mut self, block_hash: &BlockHash) -> Result<(), String> {
+        let Some(block_file) = self.uncommited_blocks.remove(block_hash) else {
+            return Err(format!("Block with hash {} not found", block_hash));
+        };
+        for transaction in block_file.transactions {
+            if let Some(transaction) = self.pending_transactions.remove(&transaction.tx_id()) {
+                self.add_transaction(transaction);
+            }
+        }
+        Ok(())
+    }
+
     pub fn get_uncommited_block(&self, block_hash: &BlockHash) -> Option<&BlockFile> {
         self.uncommited_blocks.get(block_hash)
     }
 
-    fn calculate_hash(
-        transactions: &Vec<Transaction>,
-        previous_hash: &BlockHash,
-    ) -> BlockHash {
+    fn calculate_hash(transactions: &Vec<Transaction>, previous_hash: &BlockHash) -> BlockHash {
         let mut hasher = Sha256::new();
-        hasher.update(previous_hash);
+        hasher.update(previous_hash.0);
         hasher.update(serde_json::to_string(transactions).unwrap().as_bytes());
-        hasher.finalize().into()
+        BlockHash(hasher.finalize().into())
     }
 
     fn block_filename_for_index(&self, index: u32) -> String {
@@ -206,8 +266,7 @@ impl BlockKeeper {
         if (recalculated_hash != block_file.current_hash) {
             println!(
                 "recalculated_hash: {} is different from received hash: {}",
-                hex::encode(recalculated_hash),
-                hex::encode(block_file.current_hash)
+                recalculated_hash, block_file.current_hash
             );
             return Err(BlockVerificationError::InvalidBlockHash);
         }
@@ -241,7 +300,8 @@ mod tests {
         let mut block_keeper = BlockKeeper {
             path_to_blocks,
             mempool_size: 1,
-            mempool: Vec::with_capacity(1),
+            mempool: HashMap::with_capacity(1),
+            pending_transactions: HashMap::with_capacity(1),
             uncommited_blocks: HashMap::new(),
             last_commited_index: 0,
             last_commited_hash: EMPTY_HASH,

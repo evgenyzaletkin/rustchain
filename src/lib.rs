@@ -4,6 +4,7 @@ use derive_more::with_trait::From;
 use derive_more::{Constructor, Display};
 use k256::ecdsa::signature::{Signer, Verifier};
 use k256::ecdsa::{Signature, SigningKey, VerifyingKey};
+use serde::de::Unexpected::Option;
 use std::collections::{HashMap, HashSet};
 use std::ops::Deref;
 use std::path::PathBuf;
@@ -75,13 +76,15 @@ impl Consensus {
     fn new(peer_id: PeerId, known_peers: &Vec<PeerId>) -> Consensus {
         let mut participants: HashSet<PeerId> = HashSet::from_iter(known_peers.clone());
         participants.insert(peer_id);
-        let mut approvals = HashSet::with_capacity(participants.len());
-        approvals.insert(peer_id);
         Consensus {
-            approvals,
+            approvals: HashSet::with_capacity(participants.len()),
             rejections: HashSet::with_capacity(participants.len()),
             participants,
         }
+    }
+
+    fn already_voted(&self, peer_id: &PeerId) -> bool {
+        self.approvals.contains(peer_id) || self.rejections.contains(peer_id)
     }
 
     fn make_vote(&mut self, peer_id: PeerId, approve: bool) -> ConsensusResult {
@@ -224,14 +227,19 @@ impl Peer {
                 block_file,
                 signature,
                 public_key,
-            } => {
-                self.process_block_proposal(block_hash, block_file, signature, public_key, network)
-            }
+            } => self.process_block_proposal(
+                block_hash,
+                block_file,
+                signature,
+                public_key,
+                message.from,
+                network,
+            ),
             MessageBody::BlockApproved { block_hash } => {
-                Err("Block approved is not supported yet".to_string())
+                self.process_block_vote(block_hash, message.from, true)
             }
             MessageBody::BlockReject { block_hash } => {
-                Err("Block reject is not supported yet".to_string())
+                self.process_block_vote(block_hash, message.from, false)
             }
         } {
             eprintln!("Failed to process message: {e}");
@@ -346,64 +354,46 @@ impl Peer {
         block_file: Vec<u8>,
         signature: Signature,
         public_key: VerifyingKey,
+        from: PeerId,
         network: &Network,
     ) -> Result<(), String> {
-        // Verification Failed - send vote rejected
-        // Verification Succeeded and Result is Approved - commit block and send vote
-        // Verification Succeeded and Result is already voted - do nothing
-        // Verification Succeeded and Result is In Progress - send vote approved
         let verification_result = self
             .block_keeper
             .verify_block(block_hash.clone(), block_file, signature, public_key)
             .is_ok();
-        let message: MessageBody = if verification_result {
-            if let Some(consensus) = self.votings.get_mut(&block_hash) {
-                if let ConsensusResult::Approved = consensus.make_vote(self.id, true) {
-                    self.block_keeper.commit_block(&block_hash)?;
-                }
-                return Ok(());
-            } else {
-                self.votings.insert(
-                    block_hash,
-                    Consensus::new(self.id, &self.known_peers.clone()),
-                );
-                MessageBody::BlockApproved { block_hash }
-            }
-        } else {
-            MessageBody::BlockReject { block_hash }
-        };
-        network.broadcast(&message, self.id, &self.known_peers);
-        match self.update_consensus_and_get_result(
-            &block_hash,
-            &self.id.clone(),
-            verification_result,
-        ) {
+        // Verification Failed - send vote rejected
+        // Verification Succeeded and Result is Approved - commit block and send vote
+        // Verification Succeeded and Result is already voted - do nothing
+        // Verification Succeeded and Result is In Progress - send vote approved
+        let current_peer = self.id.clone();
+        let mut cons = self.get_consensus(block_hash);
+        cons.make_vote(from, true);
+        if cons.already_voted(&current_peer) {
+            return Ok(());
+        }
+        match cons.make_vote(from, verification_result) {
             ConsensusResult::Approved => {
-                self.block_keeper
-                    .commit_block(&block_hash)
-                    .expect("Failed to commit block");
+                self.block_keeper.commit_block(&block_hash)?;
             }
             ConsensusResult::Rejected => {
-                //             TODO Logic to remove block from uncommited and restore transactions to mempool
+                self.block_keeper.rollback_block(&block_hash)?;
             }
-            ConsensusResult::InProgress => {
-                //     Nothing to do here, just wait for more votes
-            }
+            ConsensusResult::InProgress => {}
+        };
+        if verification_result {
+            network.broadcast(
+                &MessageBody::BlockApproved { block_hash },
+                self.id,
+                &self.known_peers,
+            );
+        } else {
+            network.broadcast(
+                &MessageBody::BlockReject { block_hash },
+                self.id,
+                &self.known_peers,
+            );
         }
         Ok(())
-    }
-
-    fn update_consensus_and_get_result(
-        &mut self,
-        block_hash: &BlockHash,
-        voter_id: &PeerId,
-        approve: bool,
-    ) -> ConsensusResult {
-        let mut cons = self
-            .votings
-            .entry(*block_hash)
-            .or_insert_with_key(|_| Consensus::new(self.id, &self.known_peers.clone()));
-        cons.make_vote(*voter_id, approve)
     }
 
     fn disconnect_dead_peers(&mut self) {
@@ -447,6 +437,40 @@ impl Peer {
             // Send pings only when needed (the method already has the timing logic)
             self.send_ping_to_peers(network);
         }
+    }
+
+    fn process_block_vote(
+        &mut self,
+        block_hash: BlockHash,
+        from: PeerId,
+        approve: bool,
+    ) -> Result<(), String> {
+        if (self
+            .block_keeper
+            .get_uncommited_block(&block_hash)
+            .is_none())
+        {
+            return Err(format!("Block ${block_hash} is not found"));
+        }
+        let cons = self.get_consensus(block_hash);
+        if !cons.already_voted(&from) {
+            match cons.make_vote(from, approve) {
+                ConsensusResult::Approved => {
+                    self.block_keeper.commit_block(&block_hash)?;
+                }
+                ConsensusResult::Rejected => {
+                    self.block_keeper.rollback_block(&block_hash)?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    fn get_consensus(&mut self, block_hash: BlockHash) -> &mut Consensus {
+        self.votings
+            .entry(block_hash)
+            .or_insert_with(|| Consensus::new(self.id, &self.known_peers.clone()))
     }
 }
 

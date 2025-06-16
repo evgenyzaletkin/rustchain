@@ -28,7 +28,7 @@ impl KeyManager {
             key
         }
     }
-    
+
     pub fn create_key() -> SigningKey {
         SigningKey::random(&mut rand::rng())
     }
@@ -44,7 +44,7 @@ impl KeyManager {
     pub fn to_string_hex(verifying_key: &VerifyingKey) -> String {
         hex::encode(verifying_key.to_sec1_bytes())
     }
-    
+
     pub fn sign_message<T: Signable>(key: &SigningKey, signable: &T) -> Signature {
         let message = serde_json::to_vec(signable).unwrap();
         key.sign(&message)

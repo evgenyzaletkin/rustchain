@@ -4,32 +4,7 @@ use hex::FromHex;
 use k256::ecdsa::{Signature, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-//
-// #[derive(Eq, PartialEq, Clone)]
-// pub struct Signature([u8; 64]);
-//
-// impl Serialize for Signature {
-//     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-//     where
-//         S: serde::Serializer,
-//     {
-//         serializer.serialize_bytes(&self.0)
-//     }
-// }
-//
-// impl<'de> Deserialize<'de> for Signature {
-//     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-//     where
-//         D: serde::Deserializer<'de>,
-//     {
-//         let hex_str = String::deserialize(deserializer)?;
-//         let bytes = Vec::from_hex(hex_str)
-//             .map_err(|e| serde::de::Error::custom(format!("Hex decode error: {}", e)))?
-//             .try_into()
-//             .map_err(|_| serde::de::Error::custom("Invalid signature length"))?;
-//         Ok(Signature(bytes))
-//     }
-// }
+
 
 #[derive(Serialize, Deserialize, Eq, PartialEq, Clone)]
 pub struct Metadata {
@@ -62,6 +37,12 @@ pub struct Transaction {
     pub signature: Signature,
     pub public_key: VerifyingKey,
     pub metadata: Metadata,
+}
+
+impl Transaction {
+    pub fn tx_id(&self) -> String {
+        hex::encode(self.signature.to_bytes())
+    }
 }
 
 impl Signable for Transaction {}
