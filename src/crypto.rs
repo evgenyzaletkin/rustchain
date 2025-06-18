@@ -1,9 +1,8 @@
 use k256::ecdsa::signature::{Signer, Verifier};
-use k256::ecdsa::{Signature, SigningKey, VerifyingKey, signature};
+use k256::ecdsa::{signature, Signature, SigningKey, VerifyingKey};
+use serde::Serialize;
 use std::fs;
 use std::path::PathBuf;
-use k256::PublicKey;
-use serde::Serialize;
 
 pub struct KeyManager {}
 

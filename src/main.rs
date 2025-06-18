@@ -1,9 +1,12 @@
+mod server;
+
 use rustchain::network::Network;
 use rustchain::Peer;
 use std::sync::{mpsc, Arc};
 use std::thread;
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let (sender1, receiver1) = mpsc::channel();
     let (sender2, receiver2) = mpsc::channel();
     let mut peer1 = Peer::new(1, receiver1);
@@ -18,6 +21,10 @@ fn main() {
 
     let network_clone1 = Arc::clone(&network);
     let network_clone2 = Arc::clone(&network);
+    
+    tokio::spawn(async move {
+       server::run_server(network).await; 
+    });
 
     let f1 = thread::spawn(move || {
         peer1.run(&network_clone1);

@@ -1,10 +1,9 @@
 use crate::crypto::Signable;
 use crate::storage::{BlockKeeper, KeyManager};
-use hex::FromHex;
-use k256::ecdsa::{Signature, VerifyingKey};
+use k256::ecdsa::{Signature, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-
+use k256::ecdsa::signature::{Signer, Verifier};
 
 #[derive(Serialize, Deserialize, Eq, PartialEq, Clone)]
 pub struct Metadata {
@@ -34,14 +33,75 @@ pub enum Operation {
 #[derive(Serialize, Deserialize, Eq, PartialEq, Clone)]
 pub struct Transaction {
     pub operation: Operation,
-    pub signature: Signature,
-    pub public_key: VerifyingKey,
     pub metadata: Metadata,
 }
 
+#[derive(Serialize, Deserialize, Eq, PartialEq, Clone)]
+pub struct SignedTransaction {
+    pub transaction: Transaction,
+    pub signature: Signature,
+    pub public_key: VerifyingKey,
+}
+
+#[derive(Serialize, Deserialize, Eq, PartialEq, Clone)]
+pub struct VerifiedTransaction {
+    pub client_tx: SignedTransaction,
+    pub peer_signature: Signature,
+    pub peer_public_key: VerifyingKey,
+}
+
 impl Transaction {
+    pub fn to_sign_bytes(&self) -> Vec<u8> {
+        serde_json::to_vec(self).expect("Failed to serialize Transaction")
+    }
+}
+
+impl SignedTransaction {
+    pub fn new(transaction: Transaction, signing_key: &SigningKey) -> Self {
+        let signature = signing_key.sign(&transaction.to_sign_bytes());
+        let public_key = VerifyingKey::from(signing_key);
+
+        Self {
+            transaction,
+            signature,
+            public_key,
+        }
+    }
+
+    pub fn verify(&self) -> Result<(), String> {
+        self.public_key
+            .verify(&self.transaction.to_sign_bytes(), &self.signature)
+            .map_err(|e| format!("Invalid client signature: {}", e))
+    }
+
     pub fn tx_id(&self) -> String {
         hex::encode(self.signature.to_bytes())
+    }
+}
+
+impl VerifiedTransaction {
+    pub fn new(client_tx: SignedTransaction, peer_key: &SigningKey) -> Self {
+        let peer_signature = peer_key.sign(&serde_json::to_vec(&client_tx).unwrap());
+        let peer_public_key = VerifyingKey::from(peer_key);
+
+        Self {
+            client_tx,
+            peer_signature,
+            peer_public_key,
+        }
+    }
+
+    pub fn verify(&self) -> Result<(), String> {
+        // First verify the client transaction
+        self.client_tx.verify()?;
+
+        // Then verify the peer signature
+        let client_tx_bytes = serde_json::to_vec(&self.client_tx)
+            .map_err(|e| format!("Failed to serialize client transaction: {}", e))?;
+
+        self.peer_public_key
+            .verify(&client_tx_bytes, &self.peer_signature)
+            .map_err(|e| format!("Invalid peer signature: {}", e))
     }
 }
 
@@ -59,12 +119,11 @@ pub struct TransactionProcessor {
 }
 
 impl TransactionProcessor {
-
-    pub fn process_transaction(&mut self, transaction: Transaction) {
-        match transaction.operation {
+    pub fn process_transaction(&mut self, client_tx: SignedTransaction) {
+        match client_tx.transaction.operation {
             Operation::AddCoin { asset_type, amount } => {
                 self.add_coin(
-                    KeyManager::to_string_hex(&transaction.public_key),
+                    KeyManager::to_string_hex(&client_tx.public_key),
                     asset_type.clone(),
                     amount,
                 );
@@ -74,7 +133,7 @@ impl TransactionProcessor {
                 amount,
                 asset_type,
             } => self.send_coins(
-                KeyManager::to_string_hex(&transaction.public_key),
+                KeyManager::to_string_hex(&client_tx.public_key),
                 recipient,
                 asset_type,
                 amount,

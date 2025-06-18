@@ -1,8 +1,7 @@
 pub(crate) use crate::crypto::KeyManager;
 use crate::crypto::Signable;
-use crate::transactions::Transaction;
+use crate::transactions::{SignedTransaction};
 use derive_more::Display;
-use k256::ecdsa::signature::Verifier;
 use k256::ecdsa::{Signature, VerifyingKey, signature};
 use k256::sha2::{Digest, Sha256};
 use regex::Regex;
@@ -15,7 +14,7 @@ use std::sync::LazyLock;
 use std::{fmt, fs, mem};
 
 pub const DEFAULT_PATH_TO_BLOCKS: &str = "data";
-pub const DEFAULT_MEMPOOL_SIZE: usize = 100;
+pub const DEFAULT_MEMPOOL_SIZE: usize = 5;
 pub const EMPTY_HASH: BlockHash = BlockHash([0; 32]);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -47,7 +46,13 @@ impl Display for BlockHash {
 pub struct BlockFile {
     current_hash: BlockHash,
     previous_hash: BlockHash,
-    transactions: Vec<Transaction>,
+    transactions: Vec<SignedTransaction>,
+}
+
+impl From<&Vec<u8>> for BlockFile {
+    fn from(block_file_vec: &Vec<u8>) -> Self {
+        serde_json::from_slice(&block_file_vec).unwrap()
+    }
 }
 
 impl Signable for BlockFile {}
@@ -80,8 +85,8 @@ impl From<serde_json::Error> for BlockVerificationError {
 pub struct BlockKeeper {
     path_to_blocks: PathBuf,
     mempool_size: usize,
-    mempool: HashMap<String, Transaction>,
-    pending_transactions: HashMap<String, Transaction>,
+    mempool: HashMap<String, SignedTransaction>,
+    pending_transactions: HashMap<String, SignedTransaction>,
     uncommited_blocks: HashMap<BlockHash, BlockFile>,
     last_commited_index: u32,
     last_commited_hash: BlockHash,
@@ -121,9 +126,9 @@ impl BlockKeeper {
         keeper
     }
 
-    pub fn add_transaction(&mut self, transaction: Transaction) -> BlockStatus {
+    pub fn add_transaction(&mut self, transaction: SignedTransaction) -> BlockStatus {
         self.mempool.insert(transaction.tx_id(), transaction);
-        if (self.mempool.len() >= self.mempool_size) {
+        if self.mempool.len() >= self.mempool_size {
             let transactions =
                 mem::replace(&mut self.mempool, HashMap::with_capacity(self.mempool_size));
             BlockStatus::NewBlockCreated {
@@ -134,8 +139,11 @@ impl BlockKeeper {
         }
     }
 
-    fn create_new_block(&mut self, transactions_map: HashMap<String, Transaction>) -> BlockHash {
-        let transactions: Vec<Transaction> = transactions_map.values().cloned().collect();
+    fn create_new_block(
+        &mut self,
+        transactions_map: HashMap<String, SignedTransaction>,
+    ) -> BlockHash {
+        let transactions: Vec<SignedTransaction> = transactions_map.values().cloned().collect();
         let current_hash = Self::calculate_hash(&transactions, &self.previous_hash);
         let block_file = BlockFile {
             transactions,
@@ -154,9 +162,9 @@ impl BlockKeeper {
 
     // Assume the block is already verified
     pub fn add_block_from_proposal(&mut self, block_file: BlockFile) -> Result<(), String> {
-        if (self
+        if self
             .uncommited_blocks
-            .contains_key(&block_file.current_hash))
+            .contains_key(&block_file.current_hash)
         {
             return Err(format!(
                 "Block with hash {} already exists",
@@ -210,7 +218,10 @@ impl BlockKeeper {
         self.uncommited_blocks.get(block_hash)
     }
 
-    fn calculate_hash(transactions: &Vec<Transaction>, previous_hash: &BlockHash) -> BlockHash {
+    fn calculate_hash(
+        transactions: &Vec<SignedTransaction>,
+        previous_hash: &BlockHash,
+    ) -> BlockHash {
         let mut hasher = Sha256::new();
         hasher.update(previous_hash.0);
         hasher.update(serde_json::to_string(transactions).unwrap().as_bytes());
@@ -221,7 +232,7 @@ impl BlockKeeper {
         format!("{:05}.block", index)
     }
 
-    pub fn read_transactions_from_disk(&self, block_filename: &str) -> Vec<Transaction> {
+    pub fn read_transactions_from_disk(&self, block_filename: &str) -> Vec<SignedTransaction> {
         self.read_block_from_disk(block_filename).transactions
     }
 
@@ -252,37 +263,37 @@ impl BlockKeeper {
     pub fn verify_block(
         &self,
         block_hash: BlockHash,
-        block_file: Vec<u8>,
+        block_file_vec: &Vec<u8>,
         signature: Signature,
         public_key: VerifyingKey,
     ) -> Result<BlockFile, BlockVerificationError> {
-        KeyManager::verify_message(&public_key, &signature, &block_file)?;
-        let block_file: BlockFile = serde_json::from_slice::<BlockFile>(&block_file)?;
-        if (block_hash != block_file.current_hash) {
+        KeyManager::verify_message(&public_key, &signature, block_file_vec)?;
+        let block_file: BlockFile = block_file_vec.into();
+        if block_hash != block_file.current_hash {
             return Err(BlockVerificationError::InvalidBlockHash);
         }
         let recalculated_hash =
             Self::calculate_hash(&block_file.transactions, &block_file.previous_hash);
-        if (recalculated_hash != block_file.current_hash) {
+        if recalculated_hash != block_file.current_hash {
             println!(
                 "recalculated_hash: {} is different from received hash: {}",
                 recalculated_hash, block_file.current_hash
             );
             return Err(BlockVerificationError::InvalidBlockHash);
         }
-        if (block_file.previous_hash != self.previous_hash) {
+        if block_file.previous_hash != self.last_commited_hash {
             return Err(BlockVerificationError::InvalidPreviousHash);
         }
         // verify transactions
-        Ok((block_file))
+        Ok(block_file)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transactions::{AssetType, Metadata, Operation};
-    use k256::ecdsa::VerifyingKey;
+    use crate::transactions::{AssetType, Metadata, Operation, SignedTransaction, Transaction};
+
     #[test]
     fn block_save_test() {
         let path_to_blocks = PathBuf::from("target/test/data/peer_1");
@@ -290,12 +301,19 @@ mod tests {
         fs::create_dir_all(&path_to_blocks).expect("Failed to create directory");
 
         let client_key = KeyManager::create_key();
-        let client_public_key = VerifyingKey::from(client_key.clone());
-        let operation = Operation::AddCoin {
-            amount: 10,
-            asset_type: AssetType::BTC,
+
+        let transaction = Transaction {
+            operation: Operation::AddCoin {
+                amount: 10,
+                asset_type: AssetType::BTC,
+            },
+            metadata: Metadata {
+                timestamp_nanos: 100,
+                sequence_number: 1,
+            },
         };
-        let signature = KeyManager::sign_message(&client_key, &operation);
+
+        let client_transaction = SignedTransaction::new(transaction, &client_key);
 
         let mut block_keeper = BlockKeeper {
             path_to_blocks,
@@ -308,24 +326,15 @@ mod tests {
             previous_hash: EMPTY_HASH,
         };
 
-        let transaction = Transaction {
-            operation: operation,
-            signature,
-            public_key: client_public_key,
-            metadata: Metadata {
-                timestamp_nanos: 100,
-                sequence_number: 1,
-            },
-        };
         if let BlockStatus::NewBlockCreated { block_hash } =
-            block_keeper.add_transaction(transaction.clone())
+            block_keeper.add_transaction(client_transaction.clone())
         {
             block_keeper
                 .commit_block(&block_hash)
                 .expect("Failed to commit block");
             let block_file = block_keeper.read_block_from_disk("00001.block");
             assert_eq!(block_file.transactions.len(), 1);
-            assert!(block_file.transactions.contains(&transaction));
+            assert!(block_file.transactions.contains(&client_transaction));
         } else {
             panic!("New block not created");
         }
