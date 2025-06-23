@@ -30,9 +30,11 @@ impl BlockHash {
     }
 }
 
-impl From<[u8; 32]> for BlockHash {
-    fn from(hash: [u8; 32]) -> Self {
-        Self(hash)
+impl TryFrom<[u8; 32]> for BlockHash {
+    type Error = ();
+
+    fn try_from(hash: [u8; 32]) -> Result<Self, Self::Error> {
+        Ok(Self(hash))
     }
 }
 
@@ -143,19 +145,21 @@ impl BlockKeeper {
         &mut self,
         transactions_map: HashMap<String, SignedTransaction>,
     ) -> BlockHash {
-        let transactions: Vec<SignedTransaction> = transactions_map.values().cloned().collect();
+        let mut transactions: Vec<SignedTransaction> = transactions_map.values().cloned().collect();
+        transactions.sort_by(|a, b| a.tx_id().cmp(&b.tx_id()));
         let current_hash = Self::calculate_hash(&transactions, &self.previous_hash);
+        println!("Creating new block: {}, transactions: {:?}", current_hash, &transactions);
         let block_file = BlockFile {
             transactions,
             current_hash: current_hash.clone(),
-            previous_hash: self.previous_hash.clone(),
+            previous_hash: self.last_commited_hash.clone(),
         };
         self.previous_hash = current_hash.clone();
         self.uncommited_blocks
             .insert(current_hash.clone(), block_file);
-        for transaction in transactions_map {
+        for (tx_id, transaction) in transactions_map {
             self.pending_transactions
-                .insert(transaction.0, transaction.1);
+                .insert(tx_id, transaction);
         }
         current_hash
     }

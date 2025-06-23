@@ -119,6 +119,7 @@ pub struct Peer {
 
 impl Peer {
     const PING_INTERVAL: Duration = Duration::from_secs(10);
+    const KEEP_ALIVE: Duration = Duration::from_secs(2 * 10);
     const RECV_TIMEOUT: Duration = Duration::from_millis(100);
 
     pub fn new(id: u32, receiver: Receiver<Message>) -> Peer {
@@ -369,17 +370,17 @@ impl Peer {
         self.known_peers.retain(|peer| {
             let last_ping_opt = self.last_ping_times.get(peer);
             let last_response_opt = self.last_response_times.get(peer);
-            let retain = match (last_ping_opt, last_response_opt) {
+            let is_alive = match (last_ping_opt, last_response_opt) {
                 (None, _) => true,
-                (Some(last_ping), None) => last_ping.elapsed() < Self::PING_INTERVAL,
+                (Some(last_ping), None) => last_ping.elapsed() < Self::KEEP_ALIVE,
                 (Some(last_ping), Some(last_response)) => {
-                    last_ping.elapsed() - last_response.elapsed() < Self::PING_INTERVAL
+                    last_ping.elapsed() - last_response.elapsed() < Self::KEEP_ALIVE
                 }
             };
-            if !retain {
+            if !is_alive {
                 println!("{:?} is dead", peer);
             }
-            retain
+            is_alive
         });
     }
 
