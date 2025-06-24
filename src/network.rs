@@ -1,7 +1,41 @@
 use crate::{Message, MessageBody, PeerId};
 use rand::prelude::IteratorRandom;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::mpsc::Sender;
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize, Deserialize)]
+pub struct RegisterRequest {
+    pub peer_id: PeerId,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct PeersResponse {
+    pub peers: Vec<PeerWithAddr>,
+}
+
+impl From<&HashMap<PeerId, SocketAddr>> for PeersResponse{
+    fn from(peers: &HashMap<PeerId, SocketAddr>) -> Self {
+        let peers: Vec<PeerWithAddr> = peers
+            .into_iter()
+            .map(|(peer_id, addr)| PeerWithAddr::new(*peer_id, addr.clone()))
+            .collect();
+        Self { peers }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct PeerWithAddr {
+    peer_id: PeerId,
+    addr: SocketAddr,
+}
+
+impl PeerWithAddr {
+    pub fn new(peer_id: PeerId, addr: SocketAddr) -> Self {
+        Self { peer_id, addr }
+    }
+}
 
 #[derive(Default)]
 pub struct Network {

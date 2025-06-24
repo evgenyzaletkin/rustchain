@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
+use serde::{Deserialize, Serialize};
 use storage::BlockKeeper;
 use transactions::{SignedTransaction, TransactionProcessor, VerifiedTransaction};
 
@@ -17,7 +18,7 @@ pub mod network;
 pub mod storage;
 pub mod transactions;
 
-#[derive(Clone, Eq, PartialEq, Hash, Copy, Debug, Display, From, Constructor)]
+#[derive(Clone, Eq, PartialEq, Hash, Copy, Debug, Display, From, Constructor, Serialize, Deserialize)]
 pub struct PeerId {
     id: u32,
 }
