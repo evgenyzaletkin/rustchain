@@ -1,8 +1,8 @@
 pub(crate) use crate::crypto::KeyManager;
 use crate::crypto::Signable;
-use crate::transactions::{SignedTransaction};
+use crate::transactions::SignedTransaction;
 use derive_more::Display;
-use k256::ecdsa::{Signature, VerifyingKey, signature};
+use k256::ecdsa::{signature, Signature, VerifyingKey};
 use k256::sha2::{Digest, Sha256};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -18,7 +18,8 @@ pub const DEFAULT_MEMPOOL_SIZE: usize = 5;
 pub const EMPTY_HASH: BlockHash = BlockHash([0; 32]);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
-pub struct BlockHash([u8; 32]);
+pub struct 
+BlockHash([u8; 32]);
 
 impl BlockHash {
     pub fn new(hash: [u8; 32]) -> Self {

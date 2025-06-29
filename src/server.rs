@@ -1,32 +1,35 @@
+use crate::crypto::KeyManager;
+use crate::network::NetworkInterface;
+use crate::peer::{Message, MessageBody};
+use crate::transactions::{SignedTransaction, Transaction};
 use axum::extract::State;
 use axum::http::HeaderMap;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use rustchain::MessageBody;
-use rustchain::crypto::KeyManager;
-use rustchain::network::Network;
-use rustchain::transactions::{SignedTransaction, Transaction};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 
-pub async fn run_server(network: Arc<Network>) {
+type Network = dyn NetworkInterface + Send + Sync + 'static;
+
+
+pub async fn run_server<N: NetworkInterface>(network: Arc<Network>, addr: SocketAddr) {
     let app: Router<()> = Router::new()
         .route("/transactions", post(handle_client_transaction))
         .route("/test/transactions", post(handle_test_transaction))
+        .route("/handle", post(hande_peer_message))
         .route("/", get(handle_get))
         .with_state(network);
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
     let socket_listener = TcpListener::bind(&addr).await.unwrap();
     axum::serve(socket_listener, app).await.unwrap();
 }
-async fn handle_client_transaction(
+async fn handle_client_transaction (
     State(network): State<Arc<Network>>,
     Json(transaction): Json<SignedTransaction>,
 ) -> String {
-    match network.send_client_message(MessageBody::ClientTransaction(transaction)) {
+    match network.receive_client_message(MessageBody::ClientTransaction(transaction)) {
         Ok(_) => String::from("Transaction processed"),
         Err(e) => e.to_string(),
     }
@@ -38,7 +41,7 @@ async fn handle_get(State(network): State<Arc<Network>>) -> String {
 
 const TEST_CLIENT_DIR: &str = "data/test_clients/";
 
-async fn handle_test_transaction(
+async fn handle_test_transaction (
     State(network): State<Arc<Network>>,
     header_map: HeaderMap,
     Json(transaction): Json<Transaction>,
@@ -53,8 +56,14 @@ async fn handle_test_transaction(
 
     let key = KeyManager::get_or_create_key(&PathBuf::from(TEST_CLIENT_DIR).join(client_id));
     let client_transaction = SignedTransaction::new(transaction, &key);
-    match network.send_client_message(MessageBody::ClientTransaction(client_transaction)) {
+    match network.receive_client_message(MessageBody::ClientTransaction(client_transaction)) {
         Ok(_) => String::from("Transaction processed"),
         Err(e) => e.to_string(),
     }
+}
+
+async fn hande_peer_message(
+    State(network): State<Arc<Network>>,
+    Json(message): Json<Message>) {
+    network.on_message_received(message).expect("Failed to process message");
 }

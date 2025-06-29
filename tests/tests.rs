@@ -6,13 +6,17 @@ mod tests {
     use k256::ecdsa::SigningKey;
     use k256::ecdsa::signature::Verifier;
     use k256::ecdsa::{Signature, VerifyingKey};
-    use rustchain::Peer;
     use rustchain::crypto::KeyManager;
     use rustchain::storage::BlockKeeper;
     use rustchain::transactions::SignedTransaction;
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::mpsc;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::task::{Context, Poll};
+    use tokio::sync::mpsc;
+    use rustchain::network::LocalNetwork;
+    use rustchain::peer::Peer;
 
     const TEST_DATA_PATH: &str = "target/test/data";
 
@@ -84,7 +88,7 @@ mod tests {
 
     #[test]
     fn test_block_verification() {
-        let (send1, recv1) = mpsc::channel();
+        let (send1, recv1) = mpsc::channel(1000);
         let peer_1_dir = PathBuf::from(TEST_DATA_PATH).join("peer_1");
         recreate_dir(&peer_1_dir);
 
@@ -94,6 +98,7 @@ mod tests {
             recv1,
             peer_1_dir.clone(),
             BlockKeeper::new(peer_1_dir.clone(), 1),
+            Arc::new(LocalNetwork::default())
         );
 
         // Create and add a transaction
@@ -142,6 +147,32 @@ mod tests {
         // But they should have different tx_ids
         assert_ne!(client_transaction.tx_id(), wrong_transaction.tx_id());
     }
+
+    enum Hello {
+        Init { name: &'static str },
+        Done,
+    }
+
+    impl Future for Hello {
+        type Output = ();
+
+        fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
+            match *self {
+                Hello::Init { name } => println!("hello, {name}!"),
+                Hello::Done => panic!("Please stop polling me!"),
+            };
+
+            *self = Hello::Done;
+            Poll::Ready(())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_hello() {
+        Hello::Init { name: "world" }.await;
+    }
+
+
 
     fn recreate_dir(path: &PathBuf) {
         fs::remove_dir_all(path).ok(); // Using ok() to ignore if directory doesn't exist
