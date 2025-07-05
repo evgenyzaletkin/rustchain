@@ -26,9 +26,8 @@ async fn main() {
     tokio::spawn(async move {
         server::run_server::<RestNetwork>(clone, listening_adder.clone()).await;
     });
-    let clone = network.clone();
     tokio::spawn(async move {
-        clone.run(listening_adder).await;
+        network.run(listening_adder).await;
     });
     peer1.run().await;
 }

@@ -1,20 +1,21 @@
 use axum::extract::State;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use log::info;
+use rustchain::logging::init_logging;
+use rustchain::network;
 use rustchain::network::{PeersResponse, RegisterRequest};
 use rustchain::peer::PeerId;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use env_logger::Env;
-use log::info;
+use std::time::Instant;
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
-use rustchain::logging::init_logging;
 
 #[derive(Default)]
 struct AppState {
-    pub known_peers: HashMap<PeerId, SocketAddr>,
+    pub known_peers: HashMap<PeerId, (SocketAddr, Instant)>, // Added timestamp
 }
 
 type SharedState = Arc<RwLock<AppState>>;
@@ -22,7 +23,7 @@ type SharedState = Arc<RwLock<AppState>>;
 #[tokio::main]
 async fn main() {
     init_logging();
-    
+
     let port = std::env::var("DISCOVERY_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
@@ -48,14 +49,26 @@ async fn register_peer(
     State(shared_state): State<SharedState>,
     Json(peer_request): Json<RegisterRequest>,
 ) -> String {
+    info!("Receiving probe message from peer: {}", peer_request.peer_id);
     let mut state = shared_state.write().await;
     state
         .known_peers
-        .insert(peer_request.peer_id, peer_request.addr);
+        .insert(peer_request.peer_id, (peer_request.addr, Instant::now()));
     "Ok".to_string()
 }
 
 async fn get_peers(State(shared_state): State<SharedState>) -> String {
-    let state = shared_state.read().await;
-    serde_json::to_string(&PeersResponse::from(&state.known_peers)).unwrap()
+    let mut state = shared_state.write().await;
+    
+    state
+        .known_peers
+        .retain(|_, (_, last_seen)| last_seen.elapsed() < network::KEEP_ALIVE);
+
+    let peers: HashMap<PeerId, SocketAddr> = state
+        .known_peers
+        .iter()
+        .map(|(id, (addr, _))| (*id, *addr))
+        .collect();
+
+    serde_json::to_string(&PeersResponse::from(&peers)).unwrap()
 }

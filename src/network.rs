@@ -10,6 +10,10 @@ use std::time::Duration;
 use tokio::sync::mpsc::Sender;
 use tokio::time;
 
+pub const TICK_DURATION: Duration = Duration::from_secs(10);
+pub const KEEP_ALIVE: Duration = Duration::from_secs(20); // Time after which inactive peers are removed
+
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct RegisterRequest {
     pub peer_id: PeerId,
@@ -45,9 +49,10 @@ impl PeerWithAddr {
 
 pub trait NetworkInterface {
     fn send(&self, message: Message);
-    fn broadcast(&self, message_body: &MessageBody, from: PeerId, recipients: &Vec<PeerId>);
+    fn broadcast(&self, message_body: &MessageBody, from: PeerId);
     fn receive_client_message(&self, body: MessageBody) -> Result<(), String>;
     fn on_message_received(&self, message: Message) -> Result<(), String>;
+    fn known_peers(&self) -> Vec<PeerId>;
 }
 
 #[derive(Default)]
@@ -62,6 +67,29 @@ impl LocalNetwork {
 }
 
 impl NetworkInterface for LocalNetwork {
+    fn send(&self, message: Message) {
+        if let Some(sender) = self.senders.get(&message.to) {
+            sender.try_send(message).unwrap();
+        } else {
+            println!(
+                "Warning: Attempted to send message to unknown peer {:?}",
+                message.to
+            );
+        }
+    }
+
+    fn broadcast(&self, message_body: &MessageBody, from: PeerId) {
+        for to in self.senders.keys() {
+            if !to.eq(&from) {
+                self.send(Message {
+                    from,
+                    to: *to,
+                    body: message_body.clone(),
+                })
+            }
+        }
+    }
+
     fn receive_client_message(&self, body: MessageBody) -> Result<(), String> {
         let to = self
             .senders
@@ -76,33 +104,16 @@ impl NetworkInterface for LocalNetwork {
         Ok(())
     }
 
-    fn send(&self, message: Message) {
-        if let Some(sender) = self.senders.get(&message.to) {
-            sender.try_send(message).unwrap();
-        } else {
-            println!(
-                "Warning: Attempted to send message to unknown peer {:?}",
-                message.to
-            );
-        }
-    }
-
-    fn broadcast(&self, message_body: &MessageBody, from: PeerId, recipients: &Vec<PeerId>) {
-        for to in recipients {
-            self.send(Message {
-                from,
-                to: *to,
-                body: message_body.clone(),
-            })
-        }
-    }
-
     fn on_message_received(&self, message: Message) -> Result<(), String> {
         self.senders
             .get(&message.from)
             .unwrap()
             .try_send(message)
             .map_err(|e| e.to_string())
+    }
+
+    fn known_peers(&self) -> Vec<PeerId> {
+        self.senders.keys().cloned().collect()
     }
 }
 
@@ -115,7 +126,6 @@ pub struct RestNetwork {
 }
 
 impl RestNetwork {
-    const TICK_DURATION: Duration = Duration::from_secs(10);
 
     pub fn new(peer_id: PeerId, peer_sender: Sender<Message>) -> Self {
         let discovery_port = std::env::var("DISCOVERY_PORT")
@@ -137,16 +147,16 @@ impl RestNetwork {
             peer_id: self.peer_id,
             addr,
         };
-        Self::send_message(
-            self.client.clone(),
-            &register_req,
-            &self.discovery_addr,
-            "register",
-        )
-        .await;
-        let mut network_check_interval = time::interval(Self::TICK_DURATION);
+        let mut network_check_interval = time::interval(TICK_DURATION);
         loop {
             network_check_interval.tick().await;
+            Self::send_message(
+                self.client.clone(),
+                &register_req,
+                &self.discovery_addr,
+                "register",
+            )
+            .await;
             self.update_peers().await;
         }
     }
@@ -177,16 +187,6 @@ impl RestNetwork {
         let to = to.clone();
         let path = path.to_string();
         let message = message.clone();
-        // task::block_in_place(move || {
-        //     Handle::current().block_on(async move {
-        //         println!("Sending message to {:?}", to);
-        //         client
-        //             .post(format!("http://{}/{}", to, path))
-        //             .json(&message)
-        //             .send()
-        //             .await;
-        //     })
-        // });
         client
             .post(format!("http://{}/{}", to, path))
             .json(&message)
@@ -208,7 +208,7 @@ impl NetworkInterface for RestNetwork {
         }
     }
 
-    fn broadcast(&self, message_body: &MessageBody, from: PeerId, recipients: &Vec<PeerId>) {
+    fn broadcast(&self, message_body: &MessageBody, from: PeerId) {
         debug!("Broadcasting message {message_body}");
         for (key, val) in self.known_peers.read().unwrap().iter() {
             if !key.eq(&from) {
@@ -238,5 +238,9 @@ impl NetworkInterface for RestNetwork {
         self.peer_sender
             .try_send(message)
             .map_err(|e| e.to_string())
+    }
+
+    fn known_peers(&self) -> Vec<PeerId> {
+        self.known_peers.read().unwrap().keys().cloned().collect()
     }
 }

@@ -36,8 +36,8 @@ pub type TxPayload = Vec<u8>;
 
 #[derive(Display, Clone, Serialize, Deserialize)]
 pub enum MessageBody {
-    Ping,
-    Pong,
+    // Ping,
+    // Pong,
     #[display("ClientTransaction")]
     ClientTransaction(SignedTransaction),
     #[display("Synchronization")]
@@ -117,9 +117,6 @@ impl Consensus {
 
 pub struct Peer<N: NetworkInterface> {
     pub id: PeerId,
-    known_peers: Vec<PeerId>,
-    last_ping_times: HashMap<PeerId, Instant>,
-    last_response_times: HashMap<PeerId, Instant>,
     receiver: Receiver<Message>,
     transaction_processor: TransactionProcessor,
     block_keeper: BlockKeeper,
@@ -130,8 +127,6 @@ pub struct Peer<N: NetworkInterface> {
 }
 
 impl<N: NetworkInterface> Peer<N> {
-    const PING_INTERVAL: Duration = Duration::from_secs(10);
-    const KEEP_ALIVE: Duration = Duration::from_secs(2 * 10);
     const RECV_TIMEOUT: Duration = Duration::from_millis(100);
 
     pub fn new(id: u32, receiver: Receiver<Message>, network: Arc<N>) -> Peer<N> {
@@ -140,9 +135,6 @@ impl<N: NetworkInterface> Peer<N> {
         let public_key = VerifyingKey::from(signing_key.clone());
         Self {
             id: id.into(),
-            known_peers: Vec::new(),
-            last_response_times: HashMap::new(),
-            last_ping_times: HashMap::new(),
             receiver,
             transaction_processor: TransactionProcessor::default(),
             signing_key,
@@ -164,9 +156,6 @@ impl<N: NetworkInterface> Peer<N> {
         let public_key = VerifyingKey::from(signing_key.clone());
         Self {
             id: id.into(),
-            known_peers: Vec::new(),
-            last_response_times: HashMap::new(),
-            last_ping_times: HashMap::new(),
             receiver,
             transaction_processor: TransactionProcessor::default(),
             signing_key,
@@ -175,18 +164,6 @@ impl<N: NetworkInterface> Peer<N> {
             votings: HashMap::new(),
             network,
         }
-    }
-
-    pub fn connect_with_peer(&mut self, peer: PeerId) {
-        self.known_peers.push(peer);
-    }
-
-    pub fn send_ping(&self, to: PeerId) {
-        self.network.send(Message {
-            from: self.id.clone(),
-            to,
-            body: MessageBody::Ping,
-        });
     }
 
     fn process_message(&mut self) -> bool {
@@ -203,21 +180,10 @@ impl<N: NetworkInterface> Peer<N> {
 
     fn handle_message(&mut self, message: Message) {
         println!("Received message: {message}");
-        self.last_response_times
-            .insert(message.from, Instant::now());
         if let Err(e) = match message.body {
             MessageBody::ClientTransaction(client_tx) => {
                 self.process_client_transaction(client_tx)
             }
-            MessageBody::Ping => {
-                self.network.send(Message {
-                    from: self.id,
-                    to: message.from,
-                    body: MessageBody::Pong,
-                });
-                Ok(())
-            }
-            MessageBody::Pong => Ok(()),
             MessageBody::Synchronization(verified_tx) => {
                 self.synchronize_transaction(verified_tx)
             }
@@ -284,8 +250,7 @@ impl<N: NetworkInterface> Peer<N> {
     ) -> Result<(), String> {
         self.network.broadcast(
             &MessageBody::Synchronization(verified_tx.clone()),
-            self.id,
-            &self.known_peers,
+            self.id
         );
         Ok(())
     }
@@ -294,7 +259,8 @@ impl<N: NetworkInterface> Peer<N> {
         &mut self,
         block_hash: BlockHash,
     ) -> Result<(), String> {
-        if !self.known_peers.is_empty() {
+        let known_peers = self.network.known_peers();
+        if !known_peers.is_empty() {
             if let Some(block_file) = self.block_keeper.get_uncommited_block(&block_hash) {
                 let block_as_bytes =
                     serde_json::to_vec(&block_file).expect("Failed to serialize block file");
@@ -306,11 +272,10 @@ impl<N: NetworkInterface> Peer<N> {
                         signature,
                         public_key: self.public_key,
                     },
-                    self.id,
-                    &self.known_peers,
+                    self.id
                 )
             }
-            let mut cons = Consensus::new(self.id, &self.known_peers);
+            let mut cons = Consensus::new(self.id, &known_peers);
             cons.make_vote(self.id, true);
             self.votings.insert(block_hash, cons);
             Ok(())
@@ -358,49 +323,16 @@ impl<N: NetworkInterface> Peer<N> {
             if verification_result {
                 self.network.broadcast(
                     &MessageBody::BlockApproved { block_hash },
-                    self.id,
-                    &self.known_peers,
+                    self.id
                 );
             } else {
                 self.network.broadcast(
                     &MessageBody::BlockReject { block_hash },
-                    self.id,
-                    &self.known_peers,
+                    self.id
                 );
             }
         }
         Ok(())
-    }
-
-    fn disconnect_dead_peers(&mut self) {
-        self.known_peers.retain(|peer| {
-            let last_ping_opt = self.last_ping_times.get(peer);
-            let last_response_opt = self.last_response_times.get(peer);
-            let is_alive = match (last_ping_opt, last_response_opt) {
-                (None, _) => true,
-                (Some(last_ping), None) => last_ping.elapsed() < Self::KEEP_ALIVE,
-                (Some(last_ping), Some(last_response)) => {
-                    last_ping.elapsed() - last_response.elapsed() < Self::KEEP_ALIVE
-                }
-            };
-            if !is_alive {
-                println!("{:?} is dead", peer);
-            }
-            is_alive
-        });
-    }
-
-    fn send_ping_to_peers(&mut self) {
-        for peer in &self.known_peers {
-            let should_send_ping = match self.last_ping_times.get(peer) {
-                Some(last_sent_time) => last_sent_time.elapsed() > Self::PING_INTERVAL,
-                None => true,
-            };
-            if should_send_ping {
-                self.send_ping(*peer);
-                self.last_ping_times.insert(*peer, Instant::now());
-            }
-        }
     }
 
     pub async fn run(&mut self) {
@@ -443,7 +375,7 @@ impl<N: NetworkInterface> Peer<N> {
     fn get_consensus(&mut self, block_hash: BlockHash) -> &mut Consensus {
         self.votings
             .entry(block_hash)
-            .or_insert_with(|| Consensus::new(self.id, &self.known_peers.clone()))
+            .or_insert_with(|| Consensus::new(self.id, &self.network.known_peers().clone()))
     }
 }
 
@@ -463,23 +395,6 @@ mod tests {
     use tokio::sync::mpsc;
 
     const TEST_DATA_PATH: &str = "target/test/data";
-
-    #[test]
-    fn simple_test() {
-        let (sender1, receiver1) = mpsc::channel(1000);
-        let (sender2, receiver2) = mpsc::channel(1000);
-        let peer_id_1 = PeerId::from(1);
-        let peer_id_2 = PeerId::from(2);
-        let mut network = LocalNetwork::default();
-        network.add_peer(peer_id_1, sender1);
-        network.add_peer(peer_id_2, sender2);
-        let arc_network = Arc::new(network);
-        let mut peer1 = Peer::<LocalNetwork>::new(1, receiver1, arc_network.clone());
-        let mut peer2 = Peer::<LocalNetwork>::new(2, receiver2, arc_network.clone());
-        peer1.send_ping(peer2.id);
-        assert!(peer2.process_message());
-        assert!(peer1.process_message());
-    }
 
     #[test]
     fn test_block_voting_between_2_peers() {
@@ -512,8 +427,6 @@ mod tests {
             BlockKeeper::new(peer_2_dir.clone(), 1),
             network.clone(),
         );
-        peer1.connect_with_peer(peer2.id);
-        peer2.connect_with_peer(peer1.id);
 
 
         let client_key = KeyManager::create_key();
