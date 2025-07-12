@@ -1,25 +1,26 @@
-pub(crate) use crate::crypto::KeyManager;
+use crate::crypto::KeyManager;
 use crate::crypto::Signable;
 use crate::transactions::SignedTransaction;
 use derive_more::Display;
-use k256::ecdsa::{signature, Signature, VerifyingKey};
+use k256::ecdsa::{Signature, VerifyingKey, signature};
 use k256::sha2::{Digest, Sha256};
+use log::{error, info, warn};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sorted_vec::SortedVec;
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::path::PathBuf;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock, RwLock};
 use std::{fmt, fs, mem};
 
 pub const DEFAULT_PATH_TO_BLOCKS: &str = "data";
 pub const DEFAULT_MEMPOOL_SIZE: usize = 5;
 pub const EMPTY_HASH: BlockHash = BlockHash([0; 32]);
+const BLOCK_PATTERN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(\d+)\.block$").unwrap());
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
-pub struct 
-BlockHash([u8; 32]);
+pub struct BlockHash([u8; 32]);
 
 impl BlockHash {
     pub fn new(hash: [u8; 32]) -> Self {
@@ -47,7 +48,8 @@ impl Display for BlockHash {
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct BlockFile {
-    current_hash: BlockHash,
+    pub index: u32,
+    pub hash: BlockHash,
     previous_hash: BlockHash,
     transactions: Vec<SignedTransaction>,
 }
@@ -55,6 +57,46 @@ pub struct BlockFile {
 impl From<&Vec<u8>> for BlockFile {
     fn from(block_file_vec: &Vec<u8>) -> Self {
         serde_json::from_slice(&block_file_vec).unwrap()
+    }
+}
+
+impl BlockFile {
+    pub fn create(
+        transactions: Vec<SignedTransaction>,
+        previous_hash: BlockHash,
+        index: u32,
+    ) -> Self {
+        Self {
+            index,
+            hash: Self::calculate_hash(&transactions, &previous_hash),
+            previous_hash,
+            transactions,
+        }
+    }
+
+    fn calculate_hash(
+        transactions: &Vec<SignedTransaction>,
+        previous_hash: &BlockHash,
+    ) -> BlockHash {
+        let mut hasher = Sha256::new();
+        hasher.update(previous_hash.0);
+        hasher.update(serde_json::to_string(transactions).unwrap().as_bytes());
+        BlockHash(hasher.finalize().into())
+    }
+
+    fn read_from_disk(block_path: &PathBuf) -> Self {
+        fs::read_to_string(block_path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<BlockFile>(&s).ok())
+            .unwrap()
+    }
+
+    fn read_from_disk_by_index(path_to_blocks: &PathBuf, index: u32) -> Self {
+        Self::read_from_disk(&path_to_blocks.join(BlockFile::block_filename_for_index(index)))
+    }
+
+    fn block_filename_for_index(index: u32) -> String {
+        format!("{:05}.block", index)
     }
 }
 
@@ -71,6 +113,7 @@ pub enum BlockVerificationError {
     DeserializationError(serde_json::Error),
     InvalidBlockHash,
     InvalidPreviousHash,
+    AlreadyAdded,
 }
 
 impl From<signature::Error> for BlockVerificationError {
@@ -85,48 +128,62 @@ impl From<serde_json::Error> for BlockVerificationError {
     }
 }
 
+#[derive(Copy, Clone, Serialize, Deserialize, Debug)]
+pub struct BlockStorageState {
+    pub block_height: u32,
+    pub last_commited_hash: BlockHash,
+}
+
 pub struct BlockKeeper {
     path_to_blocks: PathBuf,
     mempool_size: usize,
     mempool: HashMap<String, SignedTransaction>,
     pending_transactions: HashMap<String, SignedTransaction>,
     uncommited_blocks: HashMap<BlockHash, BlockFile>,
-    last_commited_index: u32,
-    last_commited_hash: BlockHash,
+    block_storage_state: Arc<RwLock<BlockStorageState>>,
     previous_hash: BlockHash,
 }
 
 impl BlockKeeper {
-    const BLOCK_PATTERN: LazyLock<Regex> =
-        LazyLock::new(|| Regex::new(r"^(\d+)\.block$").expect("invalid regex"));
-
     pub fn new(path_to_blocks: PathBuf, mempool_size: usize) -> Self {
+        let sorted_blocks = list_all_blocks(&path_to_blocks);
+        let (last_commited_index, last_commited_hash) = match sorted_blocks.last() {
+            None => (0, EMPTY_HASH),
+            Some(block_file_name) => {
+                let block_index = BLOCK_PATTERN
+                    .captures(&block_file_name)
+                    .map(|c| c[1].parse::<u32>().unwrap())
+                    .expect("Failed to parse block index");
+                let block_file = BlockFile::read_from_disk(&path_to_blocks.join(block_file_name));
+                (block_index, block_file.hash)
+            }
+        };
+        let block_storage_state = Arc::new(RwLock::new(BlockStorageState {
+            block_height: last_commited_index,
+            last_commited_hash,
+        }));
         let mut keeper = Self {
             path_to_blocks,
             mempool_size,
             mempool: HashMap::with_capacity(mempool_size),
             pending_transactions: HashMap::new(),
             uncommited_blocks: HashMap::new(),
-            last_commited_index: 0,
-            last_commited_hash: EMPTY_HASH,
+            block_storage_state,
             previous_hash: EMPTY_HASH,
         };
-        let sorted_blocks = keeper.list_all_blocks();
-        let (last_commited_index, last_commited_hash) = match sorted_blocks.last() {
-            None => (0, EMPTY_HASH),
-            Some(block_file_name) => {
-                let block_index = Self::BLOCK_PATTERN
-                    .captures(&block_file_name)
-                    .map(|c| c[1].parse::<u32>().unwrap())
-                    .expect("Failed to parse block index");
-                let block_file = keeper.read_block_from_disk(&block_file_name);
-                (block_index, block_file.previous_hash)
-            }
-        };
-        keeper.last_commited_index = last_commited_index;
-        keeper.last_commited_hash = last_commited_hash.clone();
         keeper.previous_hash = last_commited_hash;
         keeper
+    }
+
+    pub fn create_block_storage_view(&self) -> BlockStorageView {
+        BlockStorageView {
+            storage_state: self.block_storage_state.clone(),
+            path_to_blocks: self.path_to_blocks.clone(),
+        }
+    }
+
+    pub fn get_block_storage_state(&self) -> Arc<RwLock<BlockStorageState>> {
+        self.block_storage_state.clone()
     }
 
     pub fn add_transaction(&mut self, transaction: SignedTransaction) -> BlockStatus {
@@ -148,40 +205,37 @@ impl BlockKeeper {
     ) -> BlockHash {
         let mut transactions: Vec<SignedTransaction> = transactions_map.values().cloned().collect();
         transactions.sort_by(|a, b| a.tx_id().cmp(&b.tx_id()));
-        let current_hash = Self::calculate_hash(&transactions, &self.previous_hash);
-        println!("Creating new block: {}, transactions: {:?}", current_hash, &transactions);
-        let block_file = BlockFile {
+        println!("Creating new block, transactions: {:?}", &transactions);
+        let state = self.block_storage_state.read().unwrap();
+        let block_file = BlockFile::create(
             transactions,
-            current_hash: current_hash.clone(),
-            previous_hash: self.last_commited_hash.clone(),
-        };
-        self.previous_hash = current_hash.clone();
+            state.last_commited_hash,
+            state.block_height + 1,
+        );
+        let block_hash = block_file.hash.clone();
+        self.previous_hash = block_hash.clone();
         self.uncommited_blocks
-            .insert(current_hash.clone(), block_file);
+            .insert(block_hash.clone(), block_file);
         for (tx_id, transaction) in transactions_map {
-            self.pending_transactions
-                .insert(tx_id, transaction);
+            self.pending_transactions.insert(tx_id, transaction);
         }
-        current_hash
+        block_hash
     }
 
     // Assume the block is already verified
-    pub fn add_block_from_proposal(&mut self, block_file: BlockFile) -> Result<(), String> {
-        if self
-            .uncommited_blocks
-            .contains_key(&block_file.current_hash)
-        {
-            return Err(format!(
-                "Block with hash {} already exists",
-                block_file.current_hash
-            ));
-        }
-        for transaction in block_file.transactions {
+    pub fn add_external_block(
+        &mut self,
+        block_file: BlockFile,
+    ) -> Result<(), BlockVerificationError> {
+        self.verify_block(&block_file)?;
+        for transaction in block_file.transactions.iter() {
             if let Some(transaction) = self.mempool.remove(&transaction.tx_id()) {
                 self.pending_transactions
                     .insert(transaction.tx_id(), transaction);
             }
         }
+        self.uncommited_blocks
+            .insert(block_file.hash.clone(), block_file);
         Ok(())
     }
 
@@ -189,14 +243,15 @@ impl BlockKeeper {
         let Some(block_file) = self.uncommited_blocks.get(block_hash) else {
             return Err(format!("Block with hash {} not found", block_hash));
         };
-        let block_index = self.last_commited_index + 1;
-        let block_filename = self.block_filename_for_index(self.last_commited_index + 1);
+        let mut storage_state = self.block_storage_state.write().unwrap();
+        let block_index = storage_state.block_height + 1;
+        let block_filename = BlockFile::block_filename_for_index(block_index);
         let block_path = self.path_to_blocks.join(block_filename);
         let json = serde_json::to_string(&block_file).expect("Failed to serialize block file");
         match fs::write(block_path, json) {
             Ok(_) => {
-                self.last_commited_index = block_index;
-                self.last_commited_hash = block_hash.clone();
+                storage_state.block_height = block_index;
+                storage_state.last_commited_hash = block_hash.clone();
                 for transaction in &block_file.transactions {
                     self.pending_transactions.remove(&transaction.tx_id());
                 }
@@ -223,49 +278,26 @@ impl BlockKeeper {
         self.uncommited_blocks.get(block_hash)
     }
 
-    fn calculate_hash(
-        transactions: &Vec<SignedTransaction>,
-        previous_hash: &BlockHash,
-    ) -> BlockHash {
-        let mut hasher = Sha256::new();
-        hasher.update(previous_hash.0);
-        hasher.update(serde_json::to_string(transactions).unwrap().as_bytes());
-        BlockHash(hasher.finalize().into())
-    }
-
-    fn block_filename_for_index(&self, index: u32) -> String {
-        format!("{:05}.block", index)
+    fn read_block_from_disk(&self, block_filename: &str) -> BlockFile {
+        BlockFile::read_from_disk(&self.path_to_blocks.join(block_filename))
     }
 
     pub fn read_transactions_from_disk(&self, block_filename: &str) -> Vec<SignedTransaction> {
-        self.read_block_from_disk(block_filename).transactions
-    }
-
-    fn read_block_from_disk(&self, block_filename: &str) -> BlockFile {
-        let block_path = self.path_to_blocks.join(block_filename);
-        fs::read_to_string(block_path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<BlockFile>(&s).ok())
-            .expect("Failed to read block file")
+        BlockFile::read_from_disk(&self.path_to_blocks.join(block_filename)).transactions
     }
 
     pub fn list_all_blocks(&self) -> SortedVec<String> {
-        fs::read_dir(&self.path_to_blocks)
-            .ok()
-            .map(|entries| {
-                entries
-                    .filter_map(|entry| entry.ok())
-                    .filter_map(|entry| entry.file_name().to_str().map(String::from))
-                    .filter(|filename| Self::BLOCK_PATTERN.is_match(&filename))
-                    .fold(SortedVec::new(), |mut sorted_vec, filename| {
-                        sorted_vec.push(filename);
-                        sorted_vec
-                    })
-            })
-            .unwrap_or(SortedVec::new())
+        list_all_blocks(&self.path_to_blocks)
     }
 
-    pub fn verify_block(
+    pub fn block_can_be_added(&self, block_file: &BlockFile) -> bool {
+        !self.uncommited_blocks.contains_key(&block_file.hash)
+            && self.block_storage_state.read().unwrap().block_height == block_file.index - 1
+    }
+
+
+
+    pub fn verify_block_vec(
         &self,
         block_hash: BlockHash,
         block_file_vec: &Vec<u8>,
@@ -274,39 +306,126 @@ impl BlockKeeper {
     ) -> Result<BlockFile, BlockVerificationError> {
         KeyManager::verify_message(&public_key, &signature, block_file_vec)?;
         let block_file: BlockFile = block_file_vec.into();
-        if block_hash != block_file.current_hash {
+        if block_hash != block_file.hash {
             return Err(BlockVerificationError::InvalidBlockHash);
         }
-        let recalculated_hash =
-            Self::calculate_hash(&block_file.transactions, &block_file.previous_hash);
-        if recalculated_hash != block_file.current_hash {
-            println!(
+        self.verify_block(&block_file)?;
+        Ok(block_file)
+    }
+
+    fn verify_block(&self, block_file: &BlockFile) -> Result<(), BlockVerificationError> {
+        let calculated_hash =
+            BlockFile::calculate_hash(&block_file.transactions, &block_file.previous_hash);
+        if calculated_hash != block_file.hash {
+            info!(
                 "recalculated_hash: {} is different from received hash: {}",
-                recalculated_hash, block_file.current_hash
+                calculated_hash, block_file.hash
             );
             return Err(BlockVerificationError::InvalidBlockHash);
         }
-        if block_file.previous_hash != self.last_commited_hash {
+        if block_file.previous_hash != self.block_storage_state.read().unwrap().last_commited_hash {
             return Err(BlockVerificationError::InvalidPreviousHash);
         }
         // verify transactions
-        Ok(block_file)
+        Ok(())
     }
+}
+
+pub struct BlockStorageView {
+    storage_state: Arc<RwLock<BlockStorageState>>,
+    path_to_blocks: PathBuf,
+}
+
+impl BlockStorageView {
+    pub fn get_latest_state(&self) -> BlockStorageState {
+        *self.storage_state.read().unwrap()
+    }
+
+    pub fn get_block(&self, index: u32) -> BlockFile {
+        BlockFile::read_from_disk_by_index(&self.path_to_blocks, index)
+    }
+}
+
+fn list_all_blocks(path_to_blocks: &PathBuf) -> SortedVec<String> {
+    fs::read_dir(path_to_blocks)
+        .ok()
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok())
+                .filter_map(|entry| entry.file_name().to_str().map(String::from))
+                .filter(|filename| BLOCK_PATTERN.is_match(&filename))
+                .fold(SortedVec::new(), |mut sorted_vec, filename| {
+                    sorted_vec.push(filename);
+                    sorted_vec
+                })
+        })
+        .unwrap_or(SortedVec::new())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::transactions::{AssetType, Metadata, Operation, SignedTransaction, Transaction};
+    use k256::ecdsa::SigningKey;
+
+    fn setup() {
+        fs::remove_dir_all(path_to_blocks());
+        fs::create_dir_all(path_to_blocks()).expect("Failed to create directory");
+    }
 
     #[test]
     fn block_save_test() {
-        let path_to_blocks = PathBuf::from("target/test/data/peer_1");
-        fs::remove_dir_all(&path_to_blocks).expect("Failed to remove directory");
-        fs::create_dir_all(&path_to_blocks).expect("Failed to create directory");
-
+        setup();
         let client_key = KeyManager::create_key();
+        let mut block_keeper = create_block_keeper(1);
 
+        let client_transaction = create_test_transaction(&client_key, 1);
+        if let BlockStatus::NewBlockCreated { block_hash } =
+            block_keeper.add_transaction(client_transaction.clone())
+        {
+            block_keeper.commit_block(&block_hash).unwrap();
+            let block_file = block_keeper.read_block_from_disk("00001.block");
+            assert_eq!(block_file.transactions.len(), 1);
+            assert!(block_file.transactions.contains(&client_transaction));
+            assert_eq!(block_file.index, 1);
+        } else {
+            panic!("New block not created");
+        }
+    }
+
+    #[test]
+    fn block_must_be_created_only_when_mempool_is_full() {
+        setup();
+        let client_key = KeyManager::create_key();
+        let mut block_keeper = create_block_keeper(2);
+        let client_transaction = create_test_transaction(&client_key, 1);
+        match block_keeper.add_transaction(client_transaction.clone()) {
+            BlockStatus::AddedToMempool => {}
+            _ => panic!("Block must be created only when mempool is full"),
+        }
+        let client_transaction = create_test_transaction(&client_key, 2);
+        match block_keeper.add_transaction(client_transaction.clone()) {
+            BlockStatus::AddedToMempool => panic!("Block must have been created"),
+            _ => {}
+        }
+    }
+
+    fn create_block_keeper(size: usize) -> BlockKeeper {
+        BlockKeeper {
+            path_to_blocks: path_to_blocks(),
+            mempool_size: size,
+            mempool: HashMap::with_capacity(size),
+            pending_transactions: HashMap::with_capacity(size),
+            uncommited_blocks: HashMap::new(),
+            block_storage_state: Arc::new(RwLock::new(BlockStorageState {
+                block_height: 0,
+                last_commited_hash: EMPTY_HASH,
+            })),
+            previous_hash: EMPTY_HASH,
+        }
+    }
+
+    fn create_test_transaction(client_key: &SigningKey, sequence_number: u32) -> SignedTransaction {
         let transaction = Transaction {
             operation: Operation::AddCoin {
                 amount: 10,
@@ -314,34 +433,29 @@ mod tests {
             },
             metadata: Metadata {
                 timestamp_nanos: 100,
-                sequence_number: 1,
+                sequence_number,
             },
         };
 
-        let client_transaction = SignedTransaction::new(transaction, &client_key);
+        SignedTransaction::new(transaction.clone(), &client_key)
+    }
 
-        let mut block_keeper = BlockKeeper {
-            path_to_blocks,
-            mempool_size: 1,
-            mempool: HashMap::with_capacity(1),
-            pending_transactions: HashMap::with_capacity(1),
-            uncommited_blocks: HashMap::new(),
-            last_commited_index: 0,
-            last_commited_hash: EMPTY_HASH,
-            previous_hash: EMPTY_HASH,
-        };
+    fn path_to_blocks() -> PathBuf {
+        PathBuf::from("target/test/data/peer_1")
+    }
 
-        if let BlockStatus::NewBlockCreated { block_hash } =
-            block_keeper.add_transaction(client_transaction.clone())
-        {
-            block_keeper
-                .commit_block(&block_hash)
-                .expect("Failed to commit block");
-            let block_file = block_keeper.read_block_from_disk("00001.block");
-            assert_eq!(block_file.transactions.len(), 1);
-            assert!(block_file.transactions.contains(&client_transaction));
-        } else {
-            panic!("New block not created");
-        }
+    #[test]
+    fn parse_block_state() {
+        let json = r#"{
+            "block_height": 1,
+            "last_commited_hash": [
+                201, 46, 232, 215, 209, 112, 226, 37,
+                147, 150, 52, 152, 180, 126, 24, 76,
+                9, 233, 50, 205, 231, 207, 132, 122,
+                23, 141, 98, 78, 234, 112, 183, 142
+            ]
+         }"#;
+        let block_state: BlockStorageState = serde_json::from_str(json).unwrap();
+        assert_eq!(1, block_state.block_height)
     }
 }

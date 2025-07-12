@@ -3,8 +3,6 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use log::info;
 use rustchain::logging::init_logging;
-use rustchain::network;
-use rustchain::network::{PeersResponse, RegisterRequest};
 use rustchain::peer::PeerId;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -12,6 +10,8 @@ use std::sync::Arc;
 use std::time::Instant;
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
+use rustchain::network::{PeersResponse, RegisterRequest};
+use rustchain::network::rest_network::KEEP_ALIVE;
 
 #[derive(Default)]
 struct AppState {
@@ -62,7 +62,7 @@ async fn get_peers(State(shared_state): State<SharedState>) -> String {
     
     state
         .known_peers
-        .retain(|_, (_, last_seen)| last_seen.elapsed() < network::KEEP_ALIVE);
+        .retain(|_, (_, last_seen)| last_seen.elapsed() < KEEP_ALIVE);
 
     let peers: HashMap<PeerId, SocketAddr> = state
         .known_peers

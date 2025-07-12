@@ -5,3 +5,4 @@ pub mod storage;
 pub mod transactions;
 pub mod server;
 pub mod logging;
+mod synchronization;

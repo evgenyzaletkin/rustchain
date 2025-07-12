@@ -1,5 +1,3 @@
-use k256::ecdsa::signature::Signer;
-
 #[cfg(test)]
 mod tests {
     use ::rustchain::transactions::{AssetType, Metadata, Operation, Transaction};
@@ -7,6 +5,8 @@ mod tests {
     use k256::ecdsa::signature::Verifier;
     use k256::ecdsa::{Signature, VerifyingKey};
     use rustchain::crypto::KeyManager;
+    use rustchain::network::local_network::LocalNetwork;
+    use rustchain::peer::Peer;
     use rustchain::storage::BlockKeeper;
     use rustchain::transactions::SignedTransaction;
     use std::fs;
@@ -15,8 +15,6 @@ mod tests {
     use std::sync::Arc;
     use std::task::{Context, Poll};
     use tokio::sync::mpsc;
-    use rustchain::network::LocalNetwork;
-    use rustchain::peer::Peer;
 
     const TEST_DATA_PATH: &str = "target/test/data";
 
@@ -98,7 +96,7 @@ mod tests {
             recv1,
             peer_1_dir.clone(),
             BlockKeeper::new(peer_1_dir.clone(), 1),
-            Arc::new(LocalNetwork::default())
+            Arc::new(LocalNetwork::default()),
         );
 
         // Create and add a transaction
@@ -171,8 +169,6 @@ mod tests {
     async fn test_hello() {
         Hello::Init { name: "world" }.await;
     }
-
-
 
     fn recreate_dir(path: &PathBuf) {
         fs::remove_dir_all(path).ok(); // Using ok() to ignore if directory doesn't exist

@@ -1,32 +1,24 @@
 use crate::crypto::KeyManager;
 use crate::network::NetworkInterface;
 use crate::storage;
-use crate::storage::{BlockFile, BlockHash, BlockKeeper, BlockStatus};
+use crate::storage::{BlockHash, BlockKeeper, BlockStatus, BlockStorageView};
+use crate::synchronization::Synchronization;
 use crate::transactions::{SignedTransaction, TransactionProcessor, VerifiedTransaction};
 use derive_more::{Constructor, Display, From};
 use k256::ecdsa::signature::Signer;
 use k256::ecdsa::{Signature, SigningKey, VerifyingKey};
+use log::debug;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::sync::mpsc::error::TryRecvError;
+use std::time::Duration;
 use tokio::sync::mpsc::Receiver;
+use tokio::sync::mpsc::error::TryRecvError;
 use tokio::time;
 
 #[derive(
-    Clone,
-    Eq,
-    PartialEq,
-    Hash,
-    Copy,
-    Debug,
-    Display,
-    From,
-    Constructor,
-    Serialize,
-    Deserialize
+    Clone, Eq, PartialEq, Hash, Copy, Debug, Display, From, Constructor, Serialize, Deserialize,
 )]
 pub struct PeerId {
     id: u32,
@@ -50,9 +42,7 @@ pub enum MessageBody {
         public_key: VerifyingKey,
     },
     #[display("BlockReject")]
-    BlockReject {
-        block_hash: BlockHash,
-    },
+    BlockReject { block_hash: BlockHash },
     #[display("BlockApproved")]
     BlockApproved {
         // TODO add singature and public key
@@ -67,7 +57,6 @@ pub struct Message {
     pub to: PeerId,
     pub body: MessageBody,
 }
-
 
 enum ConsensusResult {
     InProgress,
@@ -124,6 +113,8 @@ pub struct Peer<N: NetworkInterface> {
     signing_key: SigningKey,
     public_key: VerifyingKey,
     network: Arc<N>,
+    synchronization: Synchronization<N>,
+    last_completed_block: BlockHash,
 }
 
 impl<N: NetworkInterface> Peer<N> {
@@ -131,18 +122,8 @@ impl<N: NetworkInterface> Peer<N> {
 
     pub fn new(id: u32, receiver: Receiver<Message>, network: Arc<N>) -> Peer<N> {
         let peer_dir = PathBuf::from(storage::DEFAULT_PATH_TO_BLOCKS).join(format!("peer_{}", id));
-        let signing_key = KeyManager::get_or_create_key(&peer_dir);
-        let public_key = VerifyingKey::from(signing_key.clone());
-        Self {
-            id: id.into(),
-            receiver,
-            transaction_processor: TransactionProcessor::default(),
-            signing_key,
-            public_key,
-            block_keeper: BlockKeeper::new(peer_dir, storage::DEFAULT_MEMPOOL_SIZE),
-            votings: HashMap::new(),
-            network,
-        }
+        let block_keeper = BlockKeeper::new(peer_dir.clone(), storage::DEFAULT_MEMPOOL_SIZE);
+        Self::create_with_storage(id, receiver, peer_dir, block_keeper, network)
     }
 
     pub fn create_with_storage(
@@ -154,6 +135,7 @@ impl<N: NetworkInterface> Peer<N> {
     ) -> Peer<N> {
         let signing_key = KeyManager::get_or_create_key(&peer_dir);
         let public_key = VerifyingKey::from(signing_key.clone());
+        let block_view = block_keeper.create_block_storage_view();
         Self {
             id: id.into(),
             receiver,
@@ -162,8 +144,14 @@ impl<N: NetworkInterface> Peer<N> {
             public_key,
             block_keeper,
             votings: HashMap::new(),
-            network,
+            network: network.clone(),
+            synchronization: Synchronization::new(network, block_view),
+            last_completed_block: storage::EMPTY_HASH,
         }
+    }
+
+    pub fn create_block_storage_view(&self) -> BlockStorageView {
+        self.block_keeper.create_block_storage_view()
     }
 
     fn process_message(&mut self) -> bool {
@@ -174,19 +162,15 @@ impl<N: NetworkInterface> Peer<N> {
                 true
             }
             Err(TryRecvError::Empty) => false,
-            Err(TryRecvError::Disconnected) => panic!("Channel disconnected")
+            Err(TryRecvError::Disconnected) => panic!("Channel disconnected"),
         }
     }
 
     fn handle_message(&mut self, message: Message) {
-        println!("Received message: {message}");
+        debug!("Received message: {message}");
         if let Err(e) = match message.body {
-            MessageBody::ClientTransaction(client_tx) => {
-                self.process_client_transaction(client_tx)
-            }
-            MessageBody::Synchronization(verified_tx) => {
-                self.synchronize_transaction(verified_tx)
-            }
+            MessageBody::ClientTransaction(client_tx) => self.process_client_transaction(client_tx),
+            MessageBody::Synchronization(verified_tx) => self.synchronize_transaction(verified_tx),
             MessageBody::BlockProposal {
                 block_hash,
                 block_file,
@@ -210,10 +194,7 @@ impl<N: NetworkInterface> Peer<N> {
         }
     }
 
-    fn process_client_transaction(
-        &mut self,
-        client_tx: SignedTransaction,
-    ) -> Result<(), String> {
+    fn process_client_transaction(&mut self, client_tx: SignedTransaction) -> Result<(), String> {
         client_tx.verify()?;
 
         self.transaction_processor
@@ -229,9 +210,7 @@ impl<N: NetworkInterface> Peer<N> {
         Ok(())
     }
 
-    fn synchronize_transaction(
-        &mut self,
-        verified_tx: VerifiedTransaction) -> Result<(), String> {
+    fn synchronize_transaction(&mut self, verified_tx: VerifiedTransaction) -> Result<(), String> {
         // Verify both client and peer signatures
         verified_tx.verify()?;
 
@@ -244,35 +223,27 @@ impl<N: NetworkInterface> Peer<N> {
         Ok(())
     }
 
-    fn broadcast_transaction(
-        &mut self,
-        verified_tx: &VerifiedTransaction,
-    ) -> Result<(), String> {
-        self.network.broadcast(
-            &MessageBody::Synchronization(verified_tx.clone()),
-            self.id
-        );
+    fn broadcast_transaction(&mut self, verified_tx: &VerifiedTransaction) -> Result<(), String> {
+        self.network
+            .broadcast_peer_message(&MessageBody::Synchronization(verified_tx.clone()), self.id);
         Ok(())
     }
 
-    fn broadcast_block_proposal(
-        &mut self,
-        block_hash: BlockHash,
-    ) -> Result<(), String> {
+    fn broadcast_block_proposal(&mut self, block_hash: BlockHash) -> Result<(), String> {
         let known_peers = self.network.known_peers();
         if !known_peers.is_empty() {
             if let Some(block_file) = self.block_keeper.get_uncommited_block(&block_hash) {
                 let block_as_bytes =
                     serde_json::to_vec(&block_file).expect("Failed to serialize block file");
                 let signature: Signature = self.signing_key.sign(&block_as_bytes);
-                self.network.broadcast(
+                self.network.broadcast_peer_message(
                     &MessageBody::BlockProposal {
                         block_hash,
                         block_file: block_as_bytes,
                         signature,
                         public_key: self.public_key,
                     },
-                    self.id
+                    self.id,
                 )
             }
             let mut cons = Consensus::new(self.id, &known_peers);
@@ -290,56 +261,48 @@ impl<N: NetworkInterface> Peer<N> {
         block_file: Vec<u8>,
         signature: Signature,
         public_key: VerifyingKey,
-        from: PeerId) -> Result<(), String> {
-        // Shall be replaced by pattern matching. If signature verification or hash calculation is
-        // failed - no need to save the block file. If the previous hash is different -
-        // save and wait for other votes, probably. Now, for simplicity, we just save the block file.
-        let verification_result = self
-            .block_keeper
-            .verify_block(block_hash.clone(), &block_file, signature, public_key)
-            .is_ok();
-        if self
-            .block_keeper
-            .get_uncommited_block(&block_hash)
-            .is_none()
-        {
-            self.block_keeper
-                .add_block_from_proposal(BlockFile::from(&block_file))?;
+        from: PeerId,
+    ) -> Result<(), String> {
+        if self.last_completed_block == block_hash {
+            return Ok(());
+        }
+
+        let verification_result = self.block_keeper.verify_block_vec(
+            block_hash.clone(),
+            &block_file,
+            signature,
+            public_key,
+        );
+        let mut is_ok = false;
+        if let Ok(block_file) = verification_result {
+            is_ok = true;
+            if self.block_keeper.block_can_be_added(&block_file) {
+                self.block_keeper
+                    .add_external_block(block_file)
+                    .map_err(|e| e.to_string())?;
+            }
+            // Probably, we should call synchronization here in else block if the height
+            // is less than block_index - 1
         }
         let current_peer = self.id.clone();
-        let cons = self.get_consensus(block_hash);
-        cons.make_vote(from, true);
-        let broadcast_result = cons.already_voted(&current_peer);
-        match cons.make_vote(from, verification_result) {
-            ConsensusResult::Approved => {
-                self.block_keeper.commit_block(&block_hash)?;
-            }
-            ConsensusResult::Rejected => {
-                self.block_keeper.rollback_block(&block_hash)?;
-            }
-            ConsensusResult::InProgress => {}
-        };
-        if broadcast_result {
-            if verification_result {
-                self.network.broadcast(
-                    &MessageBody::BlockApproved { block_hash },
-                    self.id
-                );
-            } else {
-                self.network.broadcast(
-                    &MessageBody::BlockReject { block_hash },
-                    self.id
-                );
-            }
-        }
-        Ok(())
+        self.make_vote(block_hash.clone(), from, true)?;
+        self.make_vote(block_hash.clone(), current_peer, is_ok)
     }
 
     pub async fn run(&mut self) {
+        self.network.wait_for_readiness().await;
         loop {
-            // Process any available messages
-            if !self.process_message() {
-                time::sleep(Self::RECV_TIMEOUT).await;
+            tokio::select! {
+                _ = self.synchronization.tick() => {
+                    self.synchronization.check_and_retrieve_missing_blocks(&mut self.block_keeper).await;
+                }
+                _ = time::sleep(Self::RECV_TIMEOUT) => {
+                    loop {
+                        if !self.process_message() {
+                            break;
+                        }
+                    }
+                }
             }
         }
     }
@@ -350,21 +313,36 @@ impl<N: NetworkInterface> Peer<N> {
         from: PeerId,
         approve: bool,
     ) -> Result<(), String> {
-        if self
+        if self.last_completed_block == block_hash {
+            return Ok(());
+        } else if self
             .block_keeper
             .get_uncommited_block(&block_hash)
             .is_none()
         {
             return Err(format!("Block ${block_hash} is not found"));
         }
+        self.make_vote(block_hash.clone(), from, approve)
+    }
+
+    pub fn make_vote(
+        &mut self,
+        block_hash: BlockHash,
+        from: PeerId,
+        approve: bool,
+    ) -> Result<(), String> {
         let cons = self.get_consensus(block_hash);
         if !cons.already_voted(&from) {
             match cons.make_vote(from, approve) {
                 ConsensusResult::Approved => {
+                    debug!("Approved block {}", block_hash);
                     self.block_keeper.commit_block(&block_hash)?;
+                    self.last_completed_block = block_hash;
                 }
                 ConsensusResult::Rejected => {
+                    debug!("Rejected block {}", block_hash);
                     self.block_keeper.rollback_block(&block_hash)?;
+                    self.last_completed_block = block_hash;
                 }
                 _ => {}
             }
@@ -379,11 +357,11 @@ impl<N: NetworkInterface> Peer<N> {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use crate::crypto::KeyManager;
-    use crate::network::{LocalNetwork, NetworkInterface};
+    use crate::network::NetworkInterface;
+    use crate::network::local_network::LocalNetwork;
     use crate::peer::{Message, MessageBody, Peer, PeerId};
     use crate::storage::BlockKeeper;
     use crate::transactions::{AssetType, Metadata, Operation, SignedTransaction, Transaction};
@@ -428,7 +406,6 @@ mod tests {
             network.clone(),
         );
 
-
         let client_key = KeyManager::create_key();
 
         let client_msg = Message {
@@ -436,12 +413,14 @@ mod tests {
             to: peer1.id.clone(),
             body: MessageBody::ClientTransaction(create_test_transaction(&client_key)),
         };
-        network.send(client_msg);
+        network.send_peer_message(client_msg);
 
         let mut should_process = true;
 
         while should_process {
-            if peer1.process_message() {} else if peer2.process_message() {} else {
+            if peer1.process_message() {
+            } else if peer2.process_message() {
+            } else {
                 should_process = false;
             }
         }

@@ -1,10 +1,10 @@
-use crate::crypto::Signable;
-use crate::storage::{BlockKeeper, KeyManager};
+use crate::crypto::{KeyManager, Signable};
+use crate::storage::BlockKeeper;
 use k256::ecdsa::signature::{Signer, Verifier};
 use k256::ecdsa::{Signature, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fmt::{Debug, Display, Formatter};
+use std::fmt::{Debug, Formatter};
 
 #[derive(Serialize, Deserialize, Eq, PartialEq, Clone)]
 pub struct Metadata {
