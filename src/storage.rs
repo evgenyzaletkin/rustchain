@@ -4,7 +4,7 @@ use crate::transactions::SignedTransaction;
 use derive_more::Display;
 use k256::ecdsa::{Signature, VerifyingKey, signature};
 use k256::sha2::{Digest, Sha256};
-use log::{error, info, warn};
+use log::{info};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sorted_vec::SortedVec;
@@ -278,10 +278,6 @@ impl BlockKeeper {
         self.uncommited_blocks.get(block_hash)
     }
 
-    fn read_block_from_disk(&self, block_filename: &str) -> BlockFile {
-        BlockFile::read_from_disk(&self.path_to_blocks.join(block_filename))
-    }
-
     pub fn read_transactions_from_disk(&self, block_filename: &str) -> Vec<SignedTransaction> {
         BlockFile::read_from_disk(&self.path_to_blocks.join(block_filename)).transactions
     }
@@ -294,8 +290,6 @@ impl BlockKeeper {
         !self.uncommited_blocks.contains_key(&block_file.hash)
             && self.block_storage_state.read().unwrap().block_height == block_file.index - 1
     }
-
-
 
     pub fn verify_block_vec(
         &self,
@@ -369,7 +363,8 @@ mod tests {
     use k256::ecdsa::SigningKey;
 
     fn setup() {
-        fs::remove_dir_all(path_to_blocks());
+        // The dir might be absent
+        let _ = fs::remove_dir_all(path_to_blocks());
         fs::create_dir_all(path_to_blocks()).expect("Failed to create directory");
     }
 
@@ -384,7 +379,7 @@ mod tests {
             block_keeper.add_transaction(client_transaction.clone())
         {
             block_keeper.commit_block(&block_hash).unwrap();
-            let block_file = block_keeper.read_block_from_disk("00001.block");
+            let block_file = BlockFile::read_from_disk_by_index(&block_keeper.path_to_blocks, 1);
             assert_eq!(block_file.transactions.len(), 1);
             assert!(block_file.transactions.contains(&client_transaction));
             assert_eq!(block_file.index, 1);

@@ -6,7 +6,7 @@ mod tests {
     use k256::ecdsa::{Signature, VerifyingKey};
     use rustchain::crypto::KeyManager;
     use rustchain::network::local_network::LocalNetwork;
-    use rustchain::peer::Peer;
+    use rustchain::peer::{Peer, PeerId};
     use rustchain::storage::BlockKeeper;
     use rustchain::transactions::SignedTransaction;
     use std::fs;
@@ -18,8 +18,8 @@ mod tests {
 
     const TEST_DATA_PATH: &str = "target/test/data";
 
-    #[test]
-    fn test_key_from_key_manager() {
+    #[tokio::test]
+    async fn test_key_from_key_manager() {
         let key_dir = PathBuf::from(TEST_DATA_PATH).join("peer_1");
         recreate_dir(&key_dir);
         let signing_key: SigningKey = KeyManager::get_or_create_key(&key_dir);
@@ -43,11 +43,7 @@ mod tests {
         client_transaction
             .verify()
             .expect("Failed to verify client transaction");
-
-        // Test serialization/deserialization
-        let tx_str =
-            serde_json::to_string(&client_transaction).expect("Failed to serialize transaction");
-
+        
         // Test key persistence
         let signing_key_from_key_manager: SigningKey = KeyManager::get_or_create_key(&key_dir);
         let client_transaction2 = SignedTransaction::new(
@@ -84,15 +80,15 @@ mod tests {
             .expect("Failed to verify signature");
     }
 
-    #[test]
-    fn test_block_verification() {
+    #[tokio::test]
+    async fn test_block_verification() {
         let (send1, recv1) = mpsc::channel(1000);
         let peer_1_dir = PathBuf::from(TEST_DATA_PATH).join("peer_1");
         recreate_dir(&peer_1_dir);
 
         let mut block_keeper = BlockKeeper::new(peer_1_dir.clone(), 1);
         let peer_1 = Peer::create_with_storage(
-            1,
+            PeerId::new(1),
             recv1,
             peer_1_dir.clone(),
             BlockKeeper::new(peer_1_dir.clone(), 1),

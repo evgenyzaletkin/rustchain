@@ -1,7 +1,8 @@
-use crate::network::NetworkInterface;
+use crate::network::{NetworkInterface, NetworkMessage};
 use crate::peer::{Message, MessageBody, PeerId};
 use rand::prelude::IteratorRandom;
 use std::collections::HashMap;
+use serde::de::DeserializeOwned;
 use tokio::sync::mpsc::Sender;
 
 #[derive(Default)]
@@ -63,5 +64,16 @@ impl NetworkInterface for LocalNetwork {
 
     fn known_peers(&self) -> Vec<PeerId> {
         self.senders.keys().cloned().collect()
+    }
+
+    async fn send_and_wait<T: DeserializeOwned>(&self, _peer_id: PeerId, _message_body: NetworkMessage) -> Result<T, String> {
+        !unimplemented!()
+    }
+
+    async fn send_and_wait_for_all<T: DeserializeOwned>(&self, _message_body: NetworkMessage, _peers: &Vec<PeerId>) -> HashMap<PeerId, Result<T, String>> {
+        !unimplemented!()
+    }
+
+    async fn wait_for_readiness(&self) {
     }
 }

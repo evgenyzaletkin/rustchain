@@ -1,0 +1,9 @@
+pub const DEFAULT_CHANNEL_SIZE: usize = 1000;
+pub const BASE_PORT: u16 = 3000;
+pub const LOCAL_HOST: [u8; 4] = [127, 0, 0, 1];
+pub const REGISTER_PATH: &str = "/register";
+pub const GET_PEERS_PATH: &str = "/peers";
+pub const HANDLE_PEER_MESSAGE_PATH: &str = "/handle";
+pub const LATEST_BLOCK_STATE_PATH: &str = "/block/state/latest";
+pub const TRANSACTIONS_PATH: &str = "/transactions";
+pub const TEST_TRANSACTIONS_PATH: &str = "/test/transactions";

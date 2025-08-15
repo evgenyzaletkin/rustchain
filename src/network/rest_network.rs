@@ -1,22 +1,23 @@
-use crate::network::{NetworkInterface, NetworkMessage, PeersResponse, RegisterRequest};
+use crate::network::{network_constants, NetworkInterface, NetworkMessage, PeersResponse, RegisterRequest};
 use crate::peer::{Message, MessageBody, PeerId};
 use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderValue, Method};
-use log::{debug, trace};
+use log::{debug, error, trace, warn};
 use reqwest::{Client, Error, Response};
 use serde::de::DeserializeOwned;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, RwLock};
+use std::sync::RwLock;
 use std::time::Duration;
-use tokio::sync::mpsc::Sender;
 use tokio::sync::Notify;
+use tokio::sync::mpsc::Sender;
 use tokio::time;
+use crate::network;
 
 pub const TICK_DURATION: Duration = Duration::from_secs(5);
-pub const KEEP_ALIVE: Duration = Duration::from_secs(20);
 // Time after which inactive peers are removed
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const NETWORK_CHECK_TRIES: usize = 5;
 
 pub struct RestNetwork {
     peer_id: PeerId,
@@ -24,7 +25,7 @@ pub struct RestNetwork {
     known_peers: RwLock<HashMap<PeerId, SocketAddr>>,
     client: Client,
     peer_sender: Sender<Message>,
-    peers_ready: Notify
+    peers_ready: Notify,
 }
 
 impl RestNetwork {
@@ -40,47 +41,59 @@ impl RestNetwork {
             known_peers: RwLock::new(HashMap::new()),
             client: Client::new(),
             peer_sender,
-            peers_ready: Notify::new()
+            peers_ready: Notify::new(),
         }
     }
 
-    pub async fn run(&self, addr: SocketAddr) {
+    pub async fn run(&self, addr: SocketAddr) -> Result<(), String> {
         let mut network_check_interval = time::interval(TICK_DURATION);
         let mut failed_checks = 0;
         loop {
             network_check_interval.tick().await;
-            match Self::send_message(
-                self.client.clone(),
-                &NetworkMessage::Register(RegisterRequest {
-                    peer_id: self.peer_id,
-                    addr,
-                }),
-                &self.discovery_addr,
-            )
-            .await
+            if failed_checks >= NETWORK_CHECK_TRIES {
+                return Err(
+                    "Failed to register with discovery server too many times. Exiting.".to_string(),
+                );
+            }
+            trace!("Registering with discovery server: try {failed_checks}");
+
+            match async {
+                self.register(addr).await?;
+                self.update_peers().await
+            }.await
             {
                 Ok(_) => {
-                    self.update_peers().await;
                     failed_checks = 0;
                 }
                 Err(e) => {
+                    warn!("Failed to register/update peers: {e}");
                     failed_checks += 1;
-                    if failed_checks >= 5 {
-                        panic!("Connection to discovery server failed: {e}");
-                    }
                 }
             }
         }
     }
 
-    async fn update_peers(&self) {
+    async fn register(&self, addr: SocketAddr) -> Result<Response, Error> {
+        Self::send_message(
+            self.client.clone(),
+            &NetworkMessage::Register(RegisterRequest {
+                peer_id: self.peer_id,
+                addr,
+            }),
+            &self.discovery_addr,
+        )
+        .await
+    }
+
+    async fn update_peers(&self) -> Result<(), Error> {
         let result = self
             .client
-            .get(format!("http://{}/peers", self.discovery_addr))
+            .get(format!("http://{}{}", self.discovery_addr, network_constants::GET_PEERS_PATH))
+            .timeout(REQUEST_TIMEOUT)
             .send()
-            .await
-            .unwrap();
-        let peers_response: PeersResponse = result.json().await.unwrap();
+            .await?;
+        trace!("Got peers response: {result:?}");
+        let peers_response: PeersResponse = result.json().await?;
         let mut known_peers = self.known_peers.write().unwrap();
         known_peers.clear();
         for peer in peers_response.peers {
@@ -89,6 +102,7 @@ impl RestNetwork {
             }
         }
         self.peers_ready.notify_waiters();
+        Ok(())
     }
 
     async fn send_message(
@@ -99,7 +113,7 @@ impl RestNetwork {
         let to = to.clone();
         let path = message.path();
         let method = message.method();
-        trace!("Sending message to {to}/{path}");
+        trace!("Sending message to {to}{path}");
 
         // let result = client
         //     .request(method, format!("http://{}/{}", to, path))
@@ -109,7 +123,7 @@ impl RestNetwork {
         //     .await;
 
         let mut builder = client
-            .request(method, format!("http://{}/{}", to, path))
+            .request(method, format!("http://{}{}", to, path))
             .timeout(REQUEST_TIMEOUT);
         if message.method() != Method::GET {
             builder = builder
@@ -244,7 +258,8 @@ impl NetworkInterface for RestNetwork {
         peer_ids: &Vec<PeerId>,
     ) -> HashMap<PeerId, Result<T, String>> {
         debug!("Sending and waiting {sync_message} to {peer_ids:?}");
-        self.send_to_all(self.client.clone(), &sync_message, peer_ids).await
+        self.send_to_all(self.client.clone(), &sync_message, peer_ids)
+            .await
     }
 
     async fn wait_for_readiness(&self) {

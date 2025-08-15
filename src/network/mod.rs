@@ -8,6 +8,7 @@ use std::net::SocketAddr;
 
 pub mod local_network;
 pub mod rest_network;
+pub mod network_constants;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct RegisterRequest {
@@ -36,12 +37,12 @@ pub enum NetworkMessage {
 impl NetworkMessage {
     fn path(&self) -> String {
         match self {
-            NetworkMessage::GetLatestBlockState => "block/state/latest".to_string(),
-            NetworkMessage::GetBlockState(idx) => format!("block/state/{}", idx),
-            NetworkMessage::GetBlock(idx) => format!("block/{}", idx),
-            NetworkMessage::PeerMessage(_) => "handle".to_string(),
-            NetworkMessage::Register(_) => "register".to_string(),
-            NetworkMessage::GetPeers => "peers".to_string(),
+            NetworkMessage::GetLatestBlockState => network_constants::LATEST_BLOCK_STATE_PATH.to_string(),
+            NetworkMessage::GetBlockState(idx) => format!("/block/state/{}", idx),
+            NetworkMessage::GetBlock(idx) => format!("/block/{}", idx),
+            NetworkMessage::PeerMessage(_) => network_constants::HANDLE_PEER_MESSAGE_PATH.to_string(),
+            NetworkMessage::Register(_) => network_constants::REGISTER_PATH.to_string(),
+            NetworkMessage::GetPeers => network_constants::GET_PEERS_PATH.to_string(),
         }
     }
 
@@ -103,17 +104,12 @@ pub trait NetworkInterface: Send + Sync + 'static {
         &self,
         _peer_id: PeerId,
         _message_body: NetworkMessage,
-    ) -> Result<T, String> {
-        !unimplemented!()
-    }
+    ) -> Result<T, String>;
     async fn send_and_wait_for_all<T: DeserializeOwned>(
         &self,
         _message_body: NetworkMessage,
         _peers: &Vec<PeerId>,   
-    ) -> HashMap<PeerId, Result<T, String>> {
-        !unimplemented!()
-    }
+    ) -> HashMap<PeerId, Result<T, String>>;
 
-    async fn wait_for_readiness(&self) {
-    }
+    async fn wait_for_readiness(&self);
 }

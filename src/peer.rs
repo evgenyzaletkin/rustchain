@@ -11,17 +11,37 @@ use log::debug;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc::Receiver;
 use tokio::sync::mpsc::error::TryRecvError;
-use tokio::time;
+use tokio::sync::mpsc::Receiver;
+
+pub const DEFAULT_CHANNEL_SIZE: usize = 1000;
 
 #[derive(
     Clone, Eq, PartialEq, Hash, Copy, Debug, Display, From, Constructor, Serialize, Deserialize,
 )]
-pub struct PeerId {
-    id: u32,
+pub struct PeerId(u32);
+
+impl FromStr for PeerId {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        s.parse().map(Self).map_err(|e| e.to_string())
+    }
+}
+
+impl TryInto<u16> for PeerId {
+    type Error = String;
+
+    fn try_into(self) -> Result<u16, Self::Error> {
+        if self.0 > u16::MAX as u32 {
+            Err(format!("PeerId is too big: {}", self.0))
+        } else {
+            Ok(self.0 as u16)
+        }
+    }
 }
 
 pub type TxPayload = Vec<u8>;
@@ -45,7 +65,7 @@ pub enum MessageBody {
     BlockReject { block_hash: BlockHash },
     #[display("BlockApproved")]
     BlockApproved {
-        // TODO add singature and public key
+        // TODO add signature and public key
         block_hash: BlockHash,
     },
 }
@@ -120,14 +140,14 @@ pub struct Peer<N: NetworkInterface> {
 impl<N: NetworkInterface> Peer<N> {
     const RECV_TIMEOUT: Duration = Duration::from_millis(100);
 
-    pub fn new(id: u32, receiver: Receiver<Message>, network: Arc<N>) -> Peer<N> {
+    pub fn new(id: PeerId, receiver: Receiver<Message>, network: Arc<N>) -> Peer<N> {
         let peer_dir = PathBuf::from(storage::DEFAULT_PATH_TO_BLOCKS).join(format!("peer_{}", id));
         let block_keeper = BlockKeeper::new(peer_dir.clone(), storage::DEFAULT_MEMPOOL_SIZE);
         Self::create_with_storage(id, receiver, peer_dir, block_keeper, network)
     }
 
     pub fn create_with_storage(
-        id: u32,
+        id: PeerId,
         receiver: Receiver<Message>,
         peer_dir: PathBuf,
         block_keeper: BlockKeeper,
@@ -135,9 +155,8 @@ impl<N: NetworkInterface> Peer<N> {
     ) -> Peer<N> {
         let signing_key = KeyManager::get_or_create_key(&peer_dir);
         let public_key = VerifyingKey::from(signing_key.clone());
-        let block_view = block_keeper.create_block_storage_view();
         Self {
-            id: id.into(),
+            id,
             receiver,
             transaction_processor: TransactionProcessor::default(),
             signing_key,
@@ -145,13 +164,33 @@ impl<N: NetworkInterface> Peer<N> {
             block_keeper,
             votings: HashMap::new(),
             network: network.clone(),
-            synchronization: Synchronization::new(network, block_view),
+            synchronization: Synchronization::new(network),
             last_completed_block: storage::EMPTY_HASH,
         }
     }
 
     pub fn create_block_storage_view(&self) -> BlockStorageView {
         self.block_keeper.create_block_storage_view()
+    }
+
+    pub async fn run(&mut self) -> Result<(), String> {
+        self.network.wait_for_readiness().await;
+        let mut sync_interval = self.synchronization.create_interval().await;
+        loop {
+            tokio::select! {
+                m = self.get_next_message() => {
+                    self.handle_message(m?);
+                },
+                _ = sync_interval.tick() => {
+                    self.synchronization.check_and_retrieve_missing_blocks(&mut self.block_keeper).await;
+                }
+
+            }
+        }
+    }
+
+    async fn get_next_message(&mut self) -> Result<Message, String> {
+        self.receiver.recv().await.ok_or_else(|| "Channel is closed".to_string())
     }
 
     fn process_message(&mut self) -> bool {
@@ -289,40 +328,19 @@ impl<N: NetworkInterface> Peer<N> {
         self.make_vote(block_hash.clone(), current_peer, is_ok)
     }
 
-    pub async fn run(&mut self) {
-        self.network.wait_for_readiness().await;
-        loop {
-            tokio::select! {
-                _ = self.synchronization.tick() => {
-                    self.synchronization.check_and_retrieve_missing_blocks(&mut self.block_keeper).await;
-                }
-                _ = time::sleep(Self::RECV_TIMEOUT) => {
-                    loop {
-                        if !self.process_message() {
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     fn process_block_vote(
         &mut self,
         block_hash: BlockHash,
         from: PeerId,
         approve: bool,
     ) -> Result<(), String> {
-        if self.last_completed_block == block_hash {
-            return Ok(());
-        } else if self
-            .block_keeper
-            .get_uncommited_block(&block_hash)
-            .is_none()
-        {
-            return Err(format!("Block ${block_hash} is not found"));
+        if self.last_completed_block != block_hash {
+            self.block_keeper
+                .get_uncommited_block(&block_hash)
+                .ok_or_else(|| format!("Block ${block_hash} is not found"))?;
+            self.make_vote(block_hash, from, approve)?;
         }
-        self.make_vote(block_hash.clone(), from, approve)
+        Ok(())
     }
 
     pub fn make_vote(
@@ -344,7 +362,7 @@ impl<N: NetworkInterface> Peer<N> {
                     self.block_keeper.rollback_block(&block_hash)?;
                     self.last_completed_block = block_hash;
                 }
-                _ => {}
+                ConsensusResult::InProgress => {}
             }
         }
         Ok(())
@@ -360,8 +378,8 @@ impl<N: NetworkInterface> Peer<N> {
 #[cfg(test)]
 mod tests {
     use crate::crypto::KeyManager;
-    use crate::network::NetworkInterface;
     use crate::network::local_network::LocalNetwork;
+    use crate::network::NetworkInterface;
     use crate::peer::{Message, MessageBody, Peer, PeerId};
     use crate::storage::BlockKeeper;
     use crate::transactions::{AssetType, Metadata, Operation, SignedTransaction, Transaction};
@@ -371,11 +389,12 @@ mod tests {
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::sync::mpsc;
+    use tokio::sync::mpsc::error::TryRecvError;
 
     const TEST_DATA_PATH: &str = "target/test/data";
 
-    #[test]
-    fn test_block_voting_between_2_peers() {
+    #[tokio::test]
+    async fn test_block_voting_between_2_peers() {
         let (sender1, receiver1) = mpsc::channel(1000);
         let (sender2, receiver2) = mpsc::channel(1000);
         let peer_1_dir = PathBuf::from(TEST_DATA_PATH).join("peer_1");
@@ -384,22 +403,22 @@ mod tests {
         recreate_dir(&peer_2_dir);
 
         let mut network = LocalNetwork::default();
-        let peer_id_1 = PeerId::from(1);
-        let peer_id_2 = PeerId::from(2);
+        let peer_id_1 = PeerId::new(1);
+        let peer_id_2 = PeerId::new(2);
         network.add_peer(peer_id_1, sender1);
         network.add_peer(peer_id_2, sender2);
 
         let network = Arc::new(network);
 
         let mut peer1 = Peer::<LocalNetwork>::create_with_storage(
-            1,
+            peer_id_1,
             receiver1,
             peer_1_dir.clone(),
             BlockKeeper::new(peer_1_dir.clone(), 1),
             network.clone(),
         );
         let mut peer2 = Peer::<LocalNetwork>::create_with_storage(
-            2,
+            peer_id_2,
             receiver2,
             peer_2_dir.clone(),
             BlockKeeper::new(peer_2_dir.clone(), 1),
@@ -448,7 +467,7 @@ mod tests {
     }
 
     fn recreate_dir(path: &PathBuf) {
-        fs::remove_dir_all(&path);
+        let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).expect("Failed to create directory");
     }
 }

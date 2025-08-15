@@ -1,5 +1,5 @@
 use crate::crypto::KeyManager;
-use crate::network::NetworkInterface;
+use crate::network::{network_constants, NetworkInterface};
 use crate::peer::{Message, MessageBody};
 use crate::storage::{BlockFile, BlockStorageState, BlockStorageView};
 use crate::transactions::{SignedTransaction, Transaction};
@@ -19,7 +19,7 @@ struct ServerState<N: NetworkInterface> {
     latest_storage_view: BlockStorageView,
 }
 
-type SharedState<N: NetworkInterface> = Arc<RwLock<ServerState<N>>>;
+type SharedState<N> = Arc<RwLock<ServerState<N>>>;
 
 pub async fn run_server<N: NetworkInterface>(
     network: Arc<N>,
@@ -31,13 +31,12 @@ pub async fn run_server<N: NetworkInterface>(
         latest_storage_view: block_storage_view,
     }));
     let app: Router<()> = Router::new()
-        .route("/transactions", post(handle_client_transaction))
-        .route("/test/transactions", post(handle_test_transaction))
-        .route("/handle", post(hande_peer_message))
-        .route("/block/state/latest", get(get_latest_storage_state))
+        .route(network_constants::TRANSACTIONS_PATH, post(handle_client_transaction))
+        .route(network_constants::TEST_TRANSACTIONS_PATH, post(handle_test_transaction))
+        .route(network_constants::HANDLE_PEER_MESSAGE_PATH, post(hande_peer_message))
+        .route(network_constants::LATEST_BLOCK_STATE_PATH, get(get_latest_storage_state))
         .route("/block/state/{block_index}", get(get_latest_storage_state))
         .route("/block/{block_index}", get(get_block))
-        .route("/", get(handle_get))
         .with_state(server_state);
 
     let socket_listener = TcpListener::bind(&addr).await.unwrap();
@@ -56,10 +55,6 @@ async fn handle_client_transaction<N: NetworkInterface>(
         Ok(_) => String::from("Transaction processed"),
         Err(e) => e.to_string(),
     }
-}
-
-async fn handle_get<N: NetworkInterface>(State(_): State<SharedState<N>>) -> String {
-    String::from("Hello, World!")
 }
 
 const TEST_CLIENT_DIR: &str = "data/test_clients/";

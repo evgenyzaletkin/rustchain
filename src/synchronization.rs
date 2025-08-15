@@ -1,6 +1,6 @@
 use crate::network::{NetworkInterface, NetworkMessage};
 use crate::peer::PeerId;
-use crate::storage::{BlockFile, BlockKeeper, BlockStorageState, BlockStorageView};
+use crate::storage::{BlockFile, BlockKeeper, BlockStorageState};
 use crate::synchronization::SyncState::{FAIL, SUCCESS};
 use log::{debug, error};
 use rand::Rng;
@@ -53,12 +53,16 @@ impl PeersStates {
 }
 
 impl<N: NetworkInterface> Synchronization<N> {
-    pub fn new(network: Arc<N>, block_storage_view: BlockStorageView) -> Self {
+    pub fn new(network: Arc<N>) -> Self {
         Self {
             network,
             sync_interval: time::interval(SYNC_INTERVAL),
             rng: rand::rng(),
         }
+    }
+    
+    pub async fn create_interval(&mut self) -> Interval {
+        time::interval(SYNC_INTERVAL)   
     }
 
     pub async fn tick(&mut self) {
@@ -87,6 +91,7 @@ impl<N: NetworkInterface> Synchronization<N> {
         );
 
         if peer_height == peers_states.get_max_index() {
+            debug!("All peers have the same height, no need to sync");
             return SUCCESS;
         }
         let mut idx = peer_height + 1;
@@ -98,7 +103,7 @@ impl<N: NetworkInterface> Synchronization<N> {
             if errors_count == 3 {
                 return FAIL;
             }
-            if let Some(block_file) = self.get_block_file(idx).await {
+            if let Some(block_file) = self.get_block_file(idx, &peers_states).await {
                 let block_hash = block_file.hash.clone();
                 debug!("Adding block {} from peer", idx);
                 block_keeper.add_external_block(block_file).unwrap();
@@ -112,10 +117,10 @@ impl<N: NetworkInterface> Synchronization<N> {
         }
     }
 
-    pub async fn get_block_file(&mut self, idx: u32) -> Option<BlockFile> {
+    async fn get_block_file(&mut self, idx: u32, peers_states: &PeersStates) -> Option<BlockFile> {
         let peers = self.network.known_peers();
         let number_of_peers = min(peers.len(), 3);
-        let peers_to_request: Vec<PeerId> = peers
+        let peers_to_request: Vec<PeerId> = peers_states.get_peers_for_index(idx)
             .choose_multiple(&mut self.rng, number_of_peers)
             .cloned()
             .collect();

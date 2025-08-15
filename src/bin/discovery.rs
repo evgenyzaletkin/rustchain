@@ -3,53 +3,68 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use log::info;
 use rustchain::logging::init_logging;
+use rustchain::network::{PeersResponse, RegisterRequest, network_constants};
 use rustchain::peer::PeerId;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
-use rustchain::network::{PeersResponse, RegisterRequest};
-use rustchain::network::rest_network::KEEP_ALIVE;
+
+const KEEP_ALIVE: Duration = Duration::from_secs(20);
+const DISCOVERY_ENV: &str = "DISCOVERY_PORT";
 
 #[derive(Default)]
 struct AppState {
-    pub known_peers: HashMap<PeerId, (SocketAddr, Instant)>, // Added timestamp
+    known_peers: HashMap<PeerId, (SocketAddr, Instant)>,
 }
 
 type SharedState = Arc<RwLock<AppState>>;
 
+struct DiscoveryConfig {
+    listening_addr: SocketAddr,
+}
+impl DiscoveryConfig {
+    fn from_env() -> Result<DiscoveryConfig, String> {
+        let port = std::env::var(DISCOVERY_ENV)
+            .ok()
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(network_constants::BASE_PORT);
+
+        let listening_addr = SocketAddr::from((network_constants::LOCAL_HOST, port));
+
+        Ok(Self { listening_addr })
+    }
+}
+
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), String> {
     init_logging();
-
-    let port = std::env::var("DISCOVERY_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(3000);
-
+    let config = DiscoveryConfig::from_env()?;
     let shared_state = SharedState::default();
     let app = Router::new()
-        .route("/register", post(register_peer))
-        .route("/peers", get(get_peers))
+        .route(network_constants::REGISTER_PATH, post(register_peer))
+        .route(network_constants::GET_PEERS_PATH, get(get_peers))
         .with_state(shared_state);
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let socket_listener = TcpListener::bind(&addr).await.unwrap();
-    info!("Starting discovery server on {}", addr);
+    let socket_listener = TcpListener::bind(&config.listening_addr).await.unwrap();
+    info!("Starting discovery server on {}", config.listening_addr);
     axum::serve(
         socket_listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
     .await
-    .unwrap();
+    .map_err(|e| e.to_string())
 }
 
 async fn register_peer(
     State(shared_state): State<SharedState>,
     Json(peer_request): Json<RegisterRequest>,
 ) -> String {
-    info!("Receiving probe message from peer: {}", peer_request.peer_id);
+    info!(
+        "Receiving probe message from peer: {}",
+        peer_request.peer_id
+    );
     let mut state = shared_state.write().await;
     state
         .known_peers
@@ -58,14 +73,19 @@ async fn register_peer(
 }
 
 async fn get_peers(State(shared_state): State<SharedState>) -> String {
-    let mut state = shared_state.write().await;
-    
-    state
-        .known_peers
-        .retain(|_, (_, last_seen)| last_seen.elapsed() < KEEP_ALIVE);
+    let read_state = shared_state.read().await;
+    let filtered: HashMap<_, _> = read_state.known_peers
+        .iter()
+        .filter(|(_, addr_and_time)| addr_and_time.1.elapsed() < KEEP_ALIVE) // your filter condition here
+        .map(|(k, v)| (k.clone(), *v))
+        .collect();
 
-    let peers: HashMap<PeerId, SocketAddr> = state
-        .known_peers
+    if filtered.len() != read_state.known_peers.len() {
+        drop(read_state);
+        shared_state.write().await.known_peers = filtered.clone();
+    }
+
+    let peers: HashMap<PeerId, SocketAddr> = filtered
         .iter()
         .map(|(id, (addr, _))| (*id, *addr))
         .collect();
