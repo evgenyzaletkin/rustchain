@@ -134,6 +134,15 @@ pub struct BlockStorageState {
     pub last_commited_hash: BlockHash,
 }
 
+impl From<&BlockFile> for BlockStorageState {
+    fn from(value: &BlockFile) -> Self {
+        BlockStorageState {
+            block_height: value.index,
+            last_commited_hash: value.hash,
+        }
+    }
+}
+
 pub struct BlockKeeper {
     path_to_blocks: PathBuf,
     mempool_size: usize,

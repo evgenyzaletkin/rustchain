@@ -35,7 +35,7 @@ pub async fn run_server<N: NetworkInterface>(
         .route(network_constants::TEST_TRANSACTIONS_PATH, post(handle_test_transaction))
         .route(network_constants::HANDLE_PEER_MESSAGE_PATH, post(hande_peer_message))
         .route(network_constants::LATEST_BLOCK_STATE_PATH, get(get_latest_storage_state))
-        .route("/block/state/{block_index}", get(get_latest_storage_state))
+        .route("/block/state/{block_index}", get(get_block_state))
         .route("/block/{block_index}", get(get_block))
         .with_state(server_state);
 
@@ -94,6 +94,15 @@ async fn hande_peer_message<N: NetworkInterface>(
         .network
         .on_message_received(message)
         .expect("Failed to process message");
+}
+
+async fn get_block_state<N: NetworkInterface>(
+    State(state): State<SharedState<N>>,
+    Path(block_index): Path<u32>,
+) -> Json<BlockStorageState> {
+    let block = state.read().await.latest_storage_view.get_block(block_index);
+    info!("received storage state request, responding with: {}", block.hash);
+    Json(BlockStorageState::from(&block))
 }
 
 async fn get_latest_storage_state<N: NetworkInterface>(

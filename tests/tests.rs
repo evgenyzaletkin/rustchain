@@ -11,15 +11,13 @@ mod tests {
     use rustchain::transactions::SignedTransaction;
     use std::fs;
     use std::path::PathBuf;
-    use std::pin::Pin;
     use std::sync::Arc;
-    use std::task::{Context, Poll};
     use tokio::sync::mpsc;
 
     const TEST_DATA_PATH: &str = "target/test/data";
 
-    #[tokio::test]
-    async fn test_key_from_key_manager() {
+    #[test]
+    fn test_key_from_key_manager() {
         let key_dir = PathBuf::from(TEST_DATA_PATH).join("peer_1");
         recreate_dir(&key_dir);
         let signing_key: SigningKey = KeyManager::get_or_create_key(&key_dir);
@@ -43,7 +41,7 @@ mod tests {
         client_transaction
             .verify()
             .expect("Failed to verify client transaction");
-        
+
         // Test key persistence
         let signing_key_from_key_manager: SigningKey = KeyManager::get_or_create_key(&key_dir);
         let client_transaction2 = SignedTransaction::new(
@@ -140,30 +138,6 @@ mod tests {
 
         // But they should have different tx_ids
         assert_ne!(client_transaction.tx_id(), wrong_transaction.tx_id());
-    }
-
-    enum Hello {
-        Init { name: &'static str },
-        Done,
-    }
-
-    impl Future for Hello {
-        type Output = ();
-
-        fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
-            match *self {
-                Hello::Init { name } => println!("hello, {name}!"),
-                Hello::Done => panic!("Please stop polling me!"),
-            };
-
-            *self = Hello::Done;
-            Poll::Ready(())
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_hello() {
-        Hello::Init { name: "world" }.await;
     }
 
     fn recreate_dir(path: &PathBuf) {

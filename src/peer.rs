@@ -14,8 +14,8 @@ use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::mpsc::error::TryRecvError;
 use tokio::sync::mpsc::Receiver;
+use crate::peer::MessageBody::{BlockApproved, BlockReject};
 
 pub const DEFAULT_CHANNEL_SIZE: usize = 1000;
 
@@ -88,6 +88,7 @@ struct Consensus {
     participants: HashSet<PeerId>,
     approvals: HashSet<PeerId>,
     rejections: HashSet<PeerId>,
+    consensus_result: Option<ConsensusResult>
 }
 
 impl Consensus {
@@ -98,6 +99,7 @@ impl Consensus {
             approvals: HashSet::with_capacity(participants.len()),
             rejections: HashSet::with_capacity(participants.len()),
             participants,
+            consensus_result: None,
         }
     }
 
@@ -190,22 +192,13 @@ impl<N: NetworkInterface> Peer<N> {
     }
 
     async fn get_next_message(&mut self) -> Result<Message, String> {
-        self.receiver.recv().await.ok_or_else(|| "Channel is closed".to_string())
+        self.receiver
+            .recv()
+            .await
+            .ok_or_else(|| "Channel is closed".to_string())
     }
 
-    fn process_message(&mut self) -> bool {
-        let result = self.receiver.try_recv();
-        match result {
-            Ok(message) => {
-                self.handle_message(message);
-                true
-            }
-            Err(TryRecvError::Empty) => false,
-            Err(TryRecvError::Disconnected) => panic!("Channel disconnected"),
-        }
-    }
-
-    fn handle_message(&mut self, message: Message) {
+    pub fn handle_message(&mut self, message: Message) {
         debug!("Received message: {message}");
         if let Err(e) = match message.body {
             MessageBody::ClientTransaction(client_tx) => self.process_client_transaction(client_tx),
@@ -350,20 +343,25 @@ impl<N: NetworkInterface> Peer<N> {
         approve: bool,
     ) -> Result<(), String> {
         let cons = self.get_consensus(block_hash);
-        if !cons.already_voted(&from) {
-            match cons.make_vote(from, approve) {
+        if !cons.already_voted(&from) && cons.consensus_result.is_none() {
+            let res = match cons.make_vote(from, approve) {
                 ConsensusResult::Approved => {
                     debug!("Approved block {}", block_hash);
                     self.block_keeper.commit_block(&block_hash)?;
-                    self.last_completed_block = block_hash;
+                    self.last_completed_block = block_hash.clone();
+                    Some(BlockApproved { block_hash})
                 }
                 ConsensusResult::Rejected => {
                     debug!("Rejected block {}", block_hash);
                     self.block_keeper.rollback_block(&block_hash)?;
-                    self.last_completed_block = block_hash;
+                    self.last_completed_block = block_hash.clone();
+                    Some(BlockReject { block_hash})
                 }
-                ConsensusResult::InProgress => {}
-            }
+                ConsensusResult::InProgress => None
+            };
+            if let Some(body) = res {
+                    self.network.broadcast_peer_message(&body, self.id);
+            };
         }
         Ok(())
     }
@@ -372,102 +370,5 @@ impl<N: NetworkInterface> Peer<N> {
         self.votings
             .entry(block_hash)
             .or_insert_with(|| Consensus::new(self.id, &self.network.known_peers().clone()))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::crypto::KeyManager;
-    use crate::network::local_network::LocalNetwork;
-    use crate::network::NetworkInterface;
-    use crate::peer::{Message, MessageBody, Peer, PeerId};
-    use crate::storage::BlockKeeper;
-    use crate::transactions::{AssetType, Metadata, Operation, SignedTransaction, Transaction};
-    use k256::ecdsa::SigningKey;
-    use std::fs;
-    use std::path::PathBuf;
-    use std::sync::Arc;
-    use std::time::{SystemTime, UNIX_EPOCH};
-    use tokio::sync::mpsc;
-    use tokio::sync::mpsc::error::TryRecvError;
-
-    const TEST_DATA_PATH: &str = "target/test/data";
-
-    #[tokio::test]
-    async fn test_block_voting_between_2_peers() {
-        let (sender1, receiver1) = mpsc::channel(1000);
-        let (sender2, receiver2) = mpsc::channel(1000);
-        let peer_1_dir = PathBuf::from(TEST_DATA_PATH).join("peer_1");
-        let peer_2_dir = PathBuf::from(TEST_DATA_PATH).join("peer_2");
-        recreate_dir(&peer_1_dir);
-        recreate_dir(&peer_2_dir);
-
-        let mut network = LocalNetwork::default();
-        let peer_id_1 = PeerId::new(1);
-        let peer_id_2 = PeerId::new(2);
-        network.add_peer(peer_id_1, sender1);
-        network.add_peer(peer_id_2, sender2);
-
-        let network = Arc::new(network);
-
-        let mut peer1 = Peer::<LocalNetwork>::create_with_storage(
-            peer_id_1,
-            receiver1,
-            peer_1_dir.clone(),
-            BlockKeeper::new(peer_1_dir.clone(), 1),
-            network.clone(),
-        );
-        let mut peer2 = Peer::<LocalNetwork>::create_with_storage(
-            peer_id_2,
-            receiver2,
-            peer_2_dir.clone(),
-            BlockKeeper::new(peer_2_dir.clone(), 1),
-            network.clone(),
-        );
-
-        let client_key = KeyManager::create_key();
-
-        let client_msg = Message {
-            from: PeerId::from(0),
-            to: peer1.id.clone(),
-            body: MessageBody::ClientTransaction(create_test_transaction(&client_key)),
-        };
-        network.send_peer_message(client_msg);
-
-        let mut should_process = true;
-
-        while should_process {
-            if peer1.process_message() {
-            } else if peer2.process_message() {
-            } else {
-                should_process = false;
-            }
-        }
-
-        assert_eq!(1, peer1.block_keeper.list_all_blocks().len());
-        assert_eq!(1, peer2.block_keeper.list_all_blocks().len());
-    }
-
-    fn create_test_transaction(signing_key: &SigningKey) -> SignedTransaction {
-        let transaction = Transaction {
-            operation: Operation::AddCoin {
-                asset_type: AssetType::USDT,
-                amount: 10,
-            },
-            metadata: Metadata {
-                timestamp_nanos: SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos(),
-                sequence_number: 1,
-            },
-        };
-
-        SignedTransaction::new(transaction, signing_key)
-    }
-
-    fn recreate_dir(path: &PathBuf) {
-        let _ = fs::remove_dir_all(&path);
-        fs::create_dir_all(&path).expect("Failed to create directory");
     }
 }

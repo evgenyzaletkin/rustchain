@@ -37,7 +37,7 @@ impl PeerConfig {
     }
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<(), String> {
     init_logging();
     let peer_config = PeerConfig::from_env()?;

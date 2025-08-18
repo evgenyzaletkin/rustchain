@@ -48,6 +48,7 @@ impl RestNetwork {
     pub async fn run(&self, addr: SocketAddr) -> Result<(), String> {
         let mut network_check_interval = time::interval(TICK_DURATION);
         let mut failed_checks = 0;
+        let mut notify_waiters = true;
         loop {
             network_check_interval.tick().await;
             if failed_checks >= NETWORK_CHECK_TRIES {
@@ -63,6 +64,10 @@ impl RestNetwork {
             }.await
             {
                 Ok(_) => {
+                    if notify_waiters {
+                        self.peers_ready.notify_waiters();
+                        notify_waiters = false;
+                    }
                     failed_checks = 0;
                 }
                 Err(e) => {
@@ -86,12 +91,11 @@ impl RestNetwork {
     }
 
     async fn update_peers(&self) -> Result<(), Error> {
-        let result = self
-            .client
-            .get(format!("http://{}{}", self.discovery_addr, network_constants::GET_PEERS_PATH))
-            .timeout(REQUEST_TIMEOUT)
-            .send()
-            .await?;
+        let result = Self::send_message(
+            self.client.clone(),
+            &NetworkMessage::GetPeers,
+            &self.discovery_addr,
+        ).await?;
         trace!("Got peers response: {result:?}");
         let peers_response: PeersResponse = result.json().await?;
         let mut known_peers = self.known_peers.write().unwrap();
@@ -101,7 +105,6 @@ impl RestNetwork {
                 known_peers.insert(peer.peer_id, peer.addr);
             }
         }
-        self.peers_ready.notify_waiters();
         Ok(())
     }
 
@@ -200,15 +203,14 @@ impl NetworkInterface for RestNetwork {
 
     fn broadcast_peer_message(&self, message_body: &MessageBody, from: PeerId) {
         debug!("Broadcasting message {message_body}");
-        for (key, val) in self.known_peers.read().unwrap().iter() {
-            if !key.eq(&from) {
+        for (peer_id, socket_addr) in self.known_peers.read().unwrap().clone() {
+            if !peer_id.eq(&from) {
                 let m = Message {
                     from,
-                    to: *key,
+                    to: peer_id,
                     body: message_body.clone(),
                 };
                 let client = self.client.clone();
-                let socket_addr = val.clone();
                 tokio::spawn(async move {
                     let _ =
                         Self::send_message(client, &NetworkMessage::PeerMessage(m), &socket_addr)

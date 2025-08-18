@@ -2,7 +2,7 @@ use crate::network::{NetworkInterface, NetworkMessage};
 use crate::peer::PeerId;
 use crate::storage::{BlockFile, BlockKeeper, BlockStorageState};
 use crate::synchronization::SyncState::{FAIL, SUCCESS};
-use log::{debug, error};
+use log::{debug, error, trace};
 use rand::Rng;
 use rand::rngs::ThreadRng;
 use rand::seq::IndexedRandom;
@@ -22,7 +22,6 @@ pub enum SyncState {
 
 pub struct Synchronization<N: NetworkInterface> {
     network: Arc<N>,
-    sync_interval: Interval,
     rng: ThreadRng,
 }
 
@@ -56,17 +55,12 @@ impl<N: NetworkInterface> Synchronization<N> {
     pub fn new(network: Arc<N>) -> Self {
         Self {
             network,
-            sync_interval: time::interval(SYNC_INTERVAL),
             rng: rand::rng(),
         }
     }
-    
-    pub async fn create_interval(&mut self) -> Interval {
-        time::interval(SYNC_INTERVAL)   
-    }
 
-    pub async fn tick(&mut self) {
-        self.sync_interval.tick().await;
+    pub async fn create_interval(&mut self) -> Interval {
+        time::interval(SYNC_INTERVAL)
     }
 
     pub async fn check_and_retrieve_missing_blocks(
@@ -118,12 +112,15 @@ impl<N: NetworkInterface> Synchronization<N> {
     }
 
     async fn get_block_file(&mut self, idx: u32, peers_states: &PeersStates) -> Option<BlockFile> {
+        trace!("Getting block file for index {}", idx);
         let peers = self.network.known_peers();
         let number_of_peers = min(peers.len(), 3);
-        let peers_to_request: Vec<PeerId> = peers_states.get_peers_for_index(idx)
+        let peers_to_request: Vec<PeerId> = peers_states
+            .get_peers_for_index(idx)
             .choose_multiple(&mut self.rng, number_of_peers)
             .cloned()
             .collect();
+        trace!("Requesting block file from peers: {:?}", peers_to_request);
         let results: Vec<BlockStorageState> = self
             .network
             .send_and_wait_for_all(NetworkMessage::GetBlockState(idx), &peers_to_request)
@@ -135,6 +132,7 @@ impl<N: NetworkInterface> Synchronization<N> {
         let all_match = results
             .windows(2)
             .all(|w| w[0].block_height == w[1].block_height);
+        trace!("Received block file states from peers: {:?}", results);
         if results.len() == number_of_peers && all_match {
             let random_peer = &peers_to_request[self.rng.random_range(0..number_of_peers)];
             debug!("Synchronizing block {} with peer {}", idx, random_peer);
