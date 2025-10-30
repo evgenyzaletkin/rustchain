@@ -1,9 +1,10 @@
-use crate::crypto::Signable;
-use crate::storage::{BlockKeeper, KeyManager};
+use crate::crypto::{KeyManager, Signable};
+use crate::storage::BlockKeeper;
+use k256::ecdsa::signature::{Signer, Verifier};
 use k256::ecdsa::{Signature, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use k256::ecdsa::signature::{Signer, Verifier};
+use std::fmt::{Debug, Formatter};
 
 #[derive(Serialize, Deserialize, Eq, PartialEq, Clone)]
 pub struct Metadata {
@@ -41,6 +42,12 @@ pub struct SignedTransaction {
     pub transaction: Transaction,
     pub signature: Signature,
     pub public_key: VerifyingKey,
+}
+
+impl Debug for SignedTransaction {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SignedTransaction {}", self.tx_id())
+    }
 }
 
 #[derive(Serialize, Deserialize, Eq, PartialEq, Clone)]
