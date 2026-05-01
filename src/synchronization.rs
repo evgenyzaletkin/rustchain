@@ -129,9 +129,7 @@ impl<N: NetworkInterface> Synchronization<N> {
             .filter(|state| state.is_ok())
             .map(|state| state.unwrap())
             .collect();
-        let all_match = results
-            .windows(2)
-            .all(|w| w[0].block_height == w[1].block_height);
+        let all_match = block_states_match(&results);
         trace!("Received block file states from peers: {:?}", results);
         if results.len() == number_of_peers && all_match {
             let random_peer = &peers_to_request[self.rng.random_range(0..number_of_peers)];
@@ -162,5 +160,47 @@ impl<N: NetworkInterface> Synchronization<N> {
             }
         }
         results
+    }
+}
+
+fn block_states_match(states: &[BlockStorageState]) -> bool {
+    states.windows(2).all(|w| w[0] == w[1])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::BlockHash;
+
+    #[test]
+    fn block_states_match_when_height_and_hash_match() {
+        let states = vec![
+            BlockStorageState {
+                block_height: 1,
+                last_commited_hash: BlockHash::new([1; 32]),
+            },
+            BlockStorageState {
+                block_height: 1,
+                last_commited_hash: BlockHash::new([1; 32]),
+            },
+        ];
+
+        assert!(block_states_match(&states));
+    }
+
+    #[test]
+    fn block_states_do_not_match_when_hash_differs_at_same_height() {
+        let states = vec![
+            BlockStorageState {
+                block_height: 1,
+                last_commited_hash: BlockHash::new([1; 32]),
+            },
+            BlockStorageState {
+                block_height: 1,
+                last_commited_hash: BlockHash::new([2; 32]),
+            },
+        ];
+
+        assert!(!block_states_match(&states));
     }
 }

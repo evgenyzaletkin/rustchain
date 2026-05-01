@@ -128,7 +128,7 @@ impl From<serde_json::Error> for BlockVerificationError {
     }
 }
 
-#[derive(Copy, Clone, Serialize, Deserialize, Debug)]
+#[derive(Copy, Clone, Serialize, Deserialize, Debug, Eq, PartialEq)]
 pub struct BlockStorageState {
     pub block_height: u32,
     pub last_commited_hash: BlockHash,
