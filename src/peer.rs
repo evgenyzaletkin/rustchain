@@ -234,7 +234,8 @@ impl<N: NetworkInterface> Peer<N> {
         client_tx.verify()?;
 
         self.transaction_processor
-            .process_transaction(client_tx.clone());
+            .process_transaction(client_tx.clone())
+            .map_err(|e| e.to_string())?;
         let status = self.block_keeper.add_transaction(client_tx.clone());
 
         let verified_tx = VerifiedTransaction::new(client_tx, &self.signing_key);

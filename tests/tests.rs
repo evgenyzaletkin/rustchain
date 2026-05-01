@@ -8,7 +8,9 @@ mod tests {
     use rustchain::network::local_network::LocalNetwork;
     use rustchain::peer::{Peer, PeerId};
     use rustchain::storage::BlockKeeper;
-    use rustchain::transactions::SignedTransaction;
+    use rustchain::transactions::{
+        SignedTransaction, TransactionProcessor, TransactionValidationError,
+    };
     use std::fs;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -138,6 +140,122 @@ mod tests {
 
         // But they should have different tx_ids
         assert_ne!(client_transaction.tx_id(), wrong_transaction.tx_id());
+    }
+
+    #[test]
+    fn test_send_from_missing_account_returns_error() {
+        let mut processor = TransactionProcessor::default();
+        let sender_key = KeyManager::create_key();
+        let sender_id = KeyManager::to_string_hex(&VerifyingKey::from(&sender_key));
+        let send_tx = create_signed_transaction(
+            &sender_key,
+            Operation::Send {
+                recipient: "recipient".to_string(),
+                amount: 10,
+                asset_type: AssetType::BTC,
+            },
+            1,
+        );
+
+        let result = processor.process_transaction(send_tx);
+
+        assert_eq!(
+            result,
+            Err(TransactionValidationError::AccountNotFound {
+                account_id: sender_id
+            })
+        );
+    }
+
+    #[test]
+    fn test_send_with_insufficient_funds_returns_error() {
+        let mut processor = TransactionProcessor::default();
+        let sender_key = KeyManager::create_key();
+        let sender_id = KeyManager::to_string_hex(&VerifyingKey::from(&sender_key));
+        processor
+            .process_transaction(create_signed_transaction(
+                &sender_key,
+                Operation::AddCoin {
+                    amount: 5,
+                    asset_type: AssetType::BTC,
+                },
+                1,
+            ))
+            .unwrap();
+
+        let result = processor.process_transaction(create_signed_transaction(
+            &sender_key,
+            Operation::Send {
+                recipient: "recipient".to_string(),
+                amount: 10,
+                asset_type: AssetType::BTC,
+            },
+            2,
+        ));
+
+        assert_eq!(
+            result,
+            Err(TransactionValidationError::InsufficientFunds {
+                account_id: sender_id.clone(),
+                balance: 5,
+                amount: 10,
+            })
+        );
+        assert_eq!(processor.get_account(&sender_id).unwrap().balance, 5);
+    }
+
+    #[test]
+    fn test_send_with_asset_mismatch_returns_error() {
+        let mut processor = TransactionProcessor::default();
+        let sender_key = KeyManager::create_key();
+        let sender_id = KeyManager::to_string_hex(&VerifyingKey::from(&sender_key));
+        processor
+            .process_transaction(create_signed_transaction(
+                &sender_key,
+                Operation::AddCoin {
+                    amount: 10,
+                    asset_type: AssetType::BTC,
+                },
+                1,
+            ))
+            .unwrap();
+
+        let result = processor.process_transaction(create_signed_transaction(
+            &sender_key,
+            Operation::Send {
+                recipient: "recipient".to_string(),
+                amount: 5,
+                asset_type: AssetType::USDT,
+            },
+            2,
+        ));
+
+        assert_eq!(
+            result,
+            Err(TransactionValidationError::AssetMismatch {
+                account_id: sender_id.clone(),
+                expected: AssetType::BTC,
+                actual: AssetType::USDT,
+            })
+        );
+        assert_eq!(processor.get_account(&sender_id).unwrap().balance, 10);
+    }
+
+    fn create_signed_transaction(
+        signing_key: &SigningKey,
+        operation: Operation,
+        sequence_number: u32,
+    ) -> SignedTransaction {
+        SignedTransaction::new(
+            Transaction {
+                operation,
+                metadata: Metadata {
+                    timestamp_nanos: 100,
+                    sequence_number,
+                },
+            },
+            signing_key,
+        )
     }
 
     fn recreate_dir(path: &PathBuf) {

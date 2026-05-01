@@ -4,7 +4,7 @@ use k256::ecdsa::signature::{Signer, Verifier};
 use k256::ecdsa::{Signature, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fmt::{Debug, Formatter};
+use std::fmt::{Debug, Display, Formatter};
 
 #[derive(Serialize, Deserialize, Eq, PartialEq, Clone)]
 pub struct Metadata {
@@ -12,7 +12,7 @@ pub struct Metadata {
     pub sequence_number: u32,
 }
 
-#[derive(Serialize, Deserialize, Eq, PartialEq, Clone)]
+#[derive(Serialize, Deserialize, Eq, PartialEq, Clone, Debug)]
 pub enum AssetType {
     BTC,
     USDT,
@@ -120,21 +120,67 @@ pub struct Account {
     pub balance: u32,
 }
 
+#[derive(Debug, Eq, PartialEq)]
+pub enum TransactionValidationError {
+    AccountNotFound {
+        account_id: String,
+    },
+    InsufficientFunds {
+        account_id: String,
+        balance: u32,
+        amount: u32,
+    },
+    AssetMismatch {
+        account_id: String,
+        expected: AssetType,
+        actual: AssetType,
+    },
+}
+
+impl Display for TransactionValidationError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TransactionValidationError::AccountNotFound { account_id } => {
+                write!(f, "Account {} not found", account_id)
+            }
+            TransactionValidationError::InsufficientFunds {
+                account_id,
+                balance,
+                amount,
+            } => write!(
+                f,
+                "Account {} has insufficient funds: balance {}, requested {}",
+                account_id, balance, amount
+            ),
+            TransactionValidationError::AssetMismatch {
+                account_id,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "Account {} asset mismatch: expected {:?}, got {:?}",
+                account_id, expected, actual
+            ),
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct TransactionProcessor {
     accounts: HashMap<String, Account>,
 }
 
 impl TransactionProcessor {
-    pub fn process_transaction(&mut self, client_tx: SignedTransaction) {
+    pub fn process_transaction(
+        &mut self,
+        client_tx: SignedTransaction,
+    ) -> Result<(), TransactionValidationError> {
         match client_tx.transaction.operation {
-            Operation::AddCoin { asset_type, amount } => {
-                self.add_coin(
-                    KeyManager::to_string_hex(&client_tx.public_key),
-                    asset_type.clone(),
-                    amount,
-                );
-            }
+            Operation::AddCoin { asset_type, amount } => self.add_coin(
+                KeyManager::to_string_hex(&client_tx.public_key),
+                asset_type.clone(),
+                amount,
+            ),
             Operation::Send {
                 recipient,
                 amount,
@@ -148,37 +194,87 @@ impl TransactionProcessor {
         }
     }
 
-    fn add_coin(&mut self, id: String, asset_type: AssetType, amount: u32) {
-        self.accounts
-            .entry(id)
-            .and_modify(|account| {
-                account.balance += amount;
-            })
-            .or_insert_with_key(|_| Account {
-                asset_type,
-                balance: amount,
-            });
+    fn add_coin(
+        &mut self,
+        id: String,
+        asset_type: AssetType,
+        amount: u32,
+    ) -> Result<(), TransactionValidationError> {
+        if let Some(account) = self.accounts.get_mut(&id) {
+            if account.asset_type != asset_type {
+                return Err(TransactionValidationError::AssetMismatch {
+                    account_id: id,
+                    expected: account.asset_type.clone(),
+                    actual: asset_type,
+                });
+            }
+            account.balance += amount;
+        } else {
+            self.accounts.insert(
+                id,
+                Account {
+                    asset_type,
+                    balance: amount,
+                },
+            );
+        }
+        Ok(())
     }
 
-    fn send_coins(&mut self, id: String, to: String, asset_type: AssetType, amount: u32) {
-        self.accounts
-            .entry(id)
-            .and_modify(|account| account.balance -= amount)
-            .or_insert_with_key(|k| panic!("Account {} not found", k));
-        self.add_coin(to, asset_type.clone(), amount);
+    fn send_coins(
+        &mut self,
+        id: String,
+        to: String,
+        asset_type: AssetType,
+        amount: u32,
+    ) -> Result<(), TransactionValidationError> {
+        let Some(sender_account) = self.accounts.get(&id) else {
+            return Err(TransactionValidationError::AccountNotFound { account_id: id });
+        };
+        if sender_account.asset_type != asset_type {
+            return Err(TransactionValidationError::AssetMismatch {
+                account_id: id,
+                expected: sender_account.asset_type.clone(),
+                actual: asset_type,
+            });
+        }
+        if sender_account.balance < amount {
+            return Err(TransactionValidationError::InsufficientFunds {
+                account_id: id,
+                balance: sender_account.balance,
+                amount,
+            });
+        }
+
+        if let Some(recipient_account) = self.accounts.get(&to) {
+            if recipient_account.asset_type != asset_type {
+                return Err(TransactionValidationError::AssetMismatch {
+                    account_id: to,
+                    expected: recipient_account.asset_type.clone(),
+                    actual: asset_type,
+                });
+            }
+        }
+
+        self.accounts.get_mut(&id).unwrap().balance -= amount;
+        self.add_coin(to, asset_type, amount)
     }
 
     pub fn get_account(&self, id: &str) -> Option<&Account> {
         self.accounts.get(id)
     }
 
-    pub fn read_state(&mut self, block_keeper: &BlockKeeper) {
+    pub fn read_state(
+        &mut self,
+        block_keeper: &BlockKeeper,
+    ) -> Result<(), TransactionValidationError> {
         let block_names = block_keeper.list_all_blocks();
         for block_name in block_names {
             let transactions = block_keeper.read_transactions_from_disk(&block_name);
             for transaction in transactions {
-                self.process_transaction(transaction);
+                self.process_transaction(transaction)?;
             }
         }
+        Ok(())
     }
 }
