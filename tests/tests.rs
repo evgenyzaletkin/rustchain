@@ -18,7 +18,7 @@ mod tests {
 
     #[test]
     fn test_key_from_key_manager() {
-        let key_dir = PathBuf::from(TEST_DATA_PATH).join("peer_1");
+        let key_dir = PathBuf::from(TEST_DATA_PATH).join("key_manager_peer");
         recreate_dir(&key_dir);
         let signing_key: SigningKey = KeyManager::get_or_create_key(&key_dir);
 
@@ -80,12 +80,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_block_verification() {
-        let (send1, recv1) = mpsc::channel(1000);
-        let peer_1_dir = PathBuf::from(TEST_DATA_PATH).join("peer_1");
+        let (_send1, recv1) = mpsc::channel(1000);
+        let peer_1_dir = PathBuf::from(TEST_DATA_PATH).join("block_verification_peer");
         recreate_dir(&peer_1_dir);
 
         let mut block_keeper = BlockKeeper::new(peer_1_dir.clone(), 1);
-        let peer_1 = Peer::create_with_storage(
+        let _peer_1 = Peer::create_with_storage(
             PeerId::new(1),
             recv1,
             peer_1_dir.clone(),

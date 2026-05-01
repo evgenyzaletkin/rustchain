@@ -1,8 +1,8 @@
-use crate::network::{network_constants, NetworkInterface, NetworkMessage, PeersResponse, RegisterRequest};
+use crate::network::{NetworkInterface, NetworkMessage, PeersResponse, RegisterRequest};
 use crate::peer::{Message, MessageBody, PeerId};
 use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderValue, Method};
-use log::{debug, error, trace, warn};
+use log::{debug, trace, warn};
 use reqwest::{Client, Error, Response};
 use serde::de::DeserializeOwned;
 use std::collections::HashMap;
@@ -12,7 +12,6 @@ use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::sync::mpsc::Sender;
 use tokio::time;
-use crate::network;
 
 pub const TICK_DURATION: Duration = Duration::from_secs(5);
 // Time after which inactive peers are removed
@@ -61,7 +60,8 @@ impl RestNetwork {
             match async {
                 self.register(addr).await?;
                 self.update_peers().await
-            }.await
+            }
+            .await
             {
                 Ok(_) => {
                     if notify_waiters {
@@ -95,7 +95,8 @@ impl RestNetwork {
             self.client.clone(),
             &NetworkMessage::GetPeers,
             &self.discovery_addr,
-        ).await?;
+        )
+        .await?;
         trace!("Got peers response: {result:?}");
         let peers_response: PeersResponse = result.json().await?;
         let mut known_peers = self.known_peers.write().unwrap();

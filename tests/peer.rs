@@ -9,10 +9,12 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::sync::mpsc;
 
     const TEST_DATA_PATH: &str = "target/test/data";
+    static TEST_DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
     #[tokio::test]
     async fn test_client_transaction_mempool_size_2() {
@@ -65,7 +67,8 @@ mod tests {
             matches!(msg_body, MessageBody::Synchronization(verified_transaction) if verified_transaction.client_tx == transaction)
         }));
         assert!(
-            broadcasted_messages.iter()
+            broadcasted_messages
+                .iter()
                 .any(|msg_body| { matches!(msg_body, MessageBody::BlockProposal { .. }) })
         );
     }
@@ -96,14 +99,15 @@ mod tests {
         let mut broadcasted_messages = network.get_broadcasted_messages();
         assert_eq!(broadcasted_messages.len(), 2);
         assert!(match &broadcasted_messages[0] {
-            MessageBody::Synchronization(verified_transaction) => verified_transaction.client_tx == transaction,
-            _ => false
+            MessageBody::Synchronization(verified_transaction) =>
+                verified_transaction.client_tx == transaction,
+            _ => false,
         });
         let block_hash = match &broadcasted_messages[1] {
-            MessageBody::BlockProposal{ block_hash, block_file, signature, public_key } => block_hash.clone(),
-            _ => panic!("Expected block proposal message")
+            MessageBody::BlockProposal { block_hash, .. } => block_hash.clone(),
+            _ => panic!("Expected block proposal message"),
         };
-        let approve_body = MessageBody::BlockApproved {block_hash};
+        let approve_body = MessageBody::BlockApproved { block_hash };
         let approve_from_2 = Message {
             from: peer_id_2,
             to: peer.id.clone(),
@@ -121,15 +125,28 @@ mod tests {
         peer.handle_message(approve_from_3);
         broadcasted_messages = network.get_broadcasted_messages();
         assert_eq!(broadcasted_messages.len(), 3);
-        assert!(broadcasted_messages.iter().any(|msg_body| {
-            matches!(msg_body, MessageBody::BlockApproved { .. })
-        }));
+        assert!(
+            broadcasted_messages
+                .iter()
+                .any(|msg_body| { matches!(msg_body, MessageBody::BlockApproved { .. }) })
+        );
 
+        let approve_from_4 = Message {
+            from: peer_id_4,
+            to: peer.id.clone(),
+            body: approve_body.clone(),
+        };
+        peer.handle_message(approve_from_4);
+        assert_eq!(network.get_broadcasted_messages().len(), 3);
+
+        peer.make_vote(block_hash, peer_id_4, true).unwrap();
+        assert_eq!(network.get_broadcasted_messages().len(), 3);
     }
 
     fn create_peer(peer_id: PeerId, network: Arc<LocalNetwork>, size: usize) -> Peer<LocalNetwork> {
         let (_, receiver) = mpsc::channel(1000);
-        let peer_1_dir = PathBuf::from(TEST_DATA_PATH).join("peer_1");
+        let dir_id = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let peer_1_dir = PathBuf::from(TEST_DATA_PATH).join(format!("peer_test_{}", dir_id));
         recreate_dir(&peer_1_dir);
         Peer::<LocalNetwork>::create_with_storage(
             peer_id,
@@ -139,7 +156,6 @@ mod tests {
             network.clone(),
         )
     }
-
 
     fn recreate_dir(path: &PathBuf) {
         let _ = fs::remove_dir_all(&path);
