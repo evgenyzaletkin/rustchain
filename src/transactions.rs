@@ -264,15 +264,14 @@ impl TransactionProcessor {
         self.accounts.get(id)
     }
 
-    pub fn read_state(
-        &mut self,
-        block_keeper: &BlockKeeper,
-    ) -> Result<(), TransactionValidationError> {
+    pub fn read_state(&mut self, block_keeper: &BlockKeeper) -> Result<(), String> {
         let block_names = block_keeper.list_all_blocks();
         for block_name in block_names {
             let transactions = block_keeper.read_transactions_from_disk(&block_name);
+            let transactions = transactions.map_err(|e| e.to_string())?;
             for transaction in transactions {
-                self.process_transaction(transaction)?;
+                self.process_transaction(transaction)
+                    .map_err(|e| e.to_string())?;
             }
         }
         Ok(())

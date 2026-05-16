@@ -84,14 +84,27 @@ impl BlockFile {
         BlockHash(hasher.finalize().into())
     }
 
-    fn read_from_disk(block_path: &PathBuf) -> Self {
-        fs::read_to_string(block_path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<BlockFile>(&s).ok())
-            .unwrap()
+    fn read_from_disk(block_path: &PathBuf) -> Result<Self, String> {
+        let block_contents = fs::read_to_string(block_path).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                format!("Block file not found: {}", block_path.display())
+            } else {
+                format!("Failed to read block file {}: {}", block_path.display(), e)
+            }
+        })?;
+        serde_json::from_str::<BlockFile>(&block_contents).map_err(|e| {
+            format!(
+                "Failed to deserialize block file {}: {}",
+                block_path.display(),
+                e
+            )
+        })
     }
 
-    fn read_from_disk_by_index(path_to_blocks: &PathBuf, index: u32) -> Self {
+    fn read_from_disk_by_index(
+        path_to_blocks: &PathBuf,
+        index: u32,
+    ) -> Result<Self, String> {
         Self::read_from_disk(&path_to_blocks.join(BlockFile::block_filename_for_index(index)))
     }
 
@@ -163,8 +176,13 @@ impl BlockKeeper {
                     .captures(&block_file_name)
                     .map(|c| c[1].parse::<u32>().unwrap())
                     .expect("Failed to parse block index");
-                let block_file = BlockFile::read_from_disk(&path_to_blocks.join(block_file_name));
-                (block_index, block_file.hash)
+                match BlockFile::read_from_disk(&path_to_blocks.join(block_file_name)) {
+                    Ok(block_file) => (block_index, block_file.hash),
+                    Err(e) => {
+                        eprintln!("Failed to read latest block state: {e}");
+                        (0, EMPTY_HASH)
+                    }
+                }
             }
         };
         let block_storage_state = Arc::new(RwLock::new(BlockStorageState {
@@ -287,8 +305,11 @@ impl BlockKeeper {
         self.uncommited_blocks.get(block_hash)
     }
 
-    pub fn read_transactions_from_disk(&self, block_filename: &str) -> Vec<SignedTransaction> {
-        BlockFile::read_from_disk(&self.path_to_blocks.join(block_filename)).transactions
+    pub fn read_transactions_from_disk(
+        &self,
+        block_filename: &str,
+    ) -> Result<Vec<SignedTransaction>, String> {
+        Ok(BlockFile::read_from_disk(&self.path_to_blocks.join(block_filename))?.transactions)
     }
 
     pub fn list_all_blocks(&self) -> SortedVec<String> {
@@ -344,7 +365,7 @@ impl BlockStorageView {
         *self.storage_state.read().unwrap()
     }
 
-    pub fn get_block(&self, index: u32) -> BlockFile {
+    pub fn get_block(&self, index: u32) -> Result<BlockFile, String> {
         BlockFile::read_from_disk_by_index(&self.path_to_blocks, index)
     }
 }
@@ -371,24 +392,26 @@ mod tests {
     use crate::transactions::{AssetType, Metadata, Operation, SignedTransaction, Transaction};
     use k256::ecdsa::SigningKey;
 
-    fn setup() {
+    fn setup(path_to_blocks: &PathBuf) {
         // The dir might be absent
-        let _ = fs::remove_dir_all(path_to_blocks());
-        fs::create_dir_all(path_to_blocks()).expect("Failed to create directory");
+        let _ = fs::remove_dir_all(path_to_blocks);
+        fs::create_dir_all(path_to_blocks).expect("Failed to create directory");
     }
 
     #[test]
     fn block_save_test() {
-        setup();
+        let path_to_blocks = path_to_blocks("block_save");
+        setup(&path_to_blocks);
         let client_key = KeyManager::create_key();
-        let mut block_keeper = create_block_keeper(1);
+        let mut block_keeper = create_block_keeper(path_to_blocks, 1);
 
         let client_transaction = create_test_transaction(&client_key, 1);
         if let BlockStatus::NewBlockCreated { block_hash } =
             block_keeper.add_transaction(client_transaction.clone())
         {
             block_keeper.commit_block(&block_hash).unwrap();
-            let block_file = BlockFile::read_from_disk_by_index(&block_keeper.path_to_blocks, 1);
+            let block_file =
+                BlockFile::read_from_disk_by_index(&block_keeper.path_to_blocks, 1).unwrap();
             assert_eq!(block_file.transactions.len(), 1);
             assert!(block_file.transactions.contains(&client_transaction));
             assert_eq!(block_file.index, 1);
@@ -399,9 +422,10 @@ mod tests {
 
     #[test]
     fn block_must_be_created_only_when_mempool_is_full() {
-        setup();
+        let path_to_blocks = path_to_blocks("mempool");
+        setup(&path_to_blocks);
         let client_key = KeyManager::create_key();
-        let mut block_keeper = create_block_keeper(2);
+        let mut block_keeper = create_block_keeper(path_to_blocks, 2);
         let client_transaction = create_test_transaction(&client_key, 1);
         match block_keeper.add_transaction(client_transaction.clone()) {
             BlockStatus::AddedToMempool => {}
@@ -414,9 +438,9 @@ mod tests {
         }
     }
 
-    fn create_block_keeper(size: usize) -> BlockKeeper {
+    fn create_block_keeper(path_to_blocks: PathBuf, size: usize) -> BlockKeeper {
         BlockKeeper {
-            path_to_blocks: path_to_blocks(),
+            path_to_blocks,
             mempool_size: size,
             mempool: HashMap::with_capacity(size),
             pending_transactions: HashMap::with_capacity(size),
@@ -444,8 +468,8 @@ mod tests {
         SignedTransaction::new(transaction.clone(), &client_key)
     }
 
-    fn path_to_blocks() -> PathBuf {
-        PathBuf::from("target/test/data/peer_1")
+    fn path_to_blocks(test_name: &str) -> PathBuf {
+        PathBuf::from("target/test/data").join(test_name)
     }
 
     #[test]
@@ -461,5 +485,36 @@ mod tests {
          }"#;
         let block_state: BlockStorageState = serde_json::from_str(json).unwrap();
         assert_eq!(1, block_state.block_height)
+    }
+
+    #[test]
+    fn missing_block_returns_read_error() {
+        let path_to_blocks = path_to_blocks("missing_block");
+        setup(&path_to_blocks);
+
+        let result = BlockFile::read_from_disk_by_index(&path_to_blocks, 99);
+
+        match result {
+            Err(e) => assert!(e.starts_with("Block file not found")),
+            Ok(_) => panic!("Expected missing block to return an error"),
+        }
+    }
+
+    #[test]
+    fn corrupt_block_returns_read_error() {
+        let path_to_blocks = path_to_blocks("corrupt_block");
+        setup(&path_to_blocks);
+        fs::write(
+            path_to_blocks.join(BlockFile::block_filename_for_index(1)),
+            "{",
+        )
+        .expect("Failed to write corrupt block fixture");
+
+        let result = BlockFile::read_from_disk_by_index(&path_to_blocks, 1);
+
+        match result {
+            Err(e) => assert!(e.starts_with("Failed to deserialize")),
+            Ok(_) => panic!("Expected corrupt block to return an error"),
+        }
     }
 }

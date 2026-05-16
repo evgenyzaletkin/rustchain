@@ -4,7 +4,7 @@ use crate::peer::{Message, MessageBody};
 use crate::storage::{BlockFile, BlockStorageState, BlockStorageView};
 use crate::transactions::{SignedTransaction, Transaction};
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap};
+use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use log::info;
@@ -99,10 +99,18 @@ async fn hande_peer_message<N: NetworkInterface>(
 async fn get_block_state<N: NetworkInterface>(
     State(state): State<SharedState<N>>,
     Path(block_index): Path<u32>,
-) -> Json<BlockStorageState> {
-    let block = state.read().await.latest_storage_view.get_block(block_index);
-    info!("received storage state request, responding with: {}", block.hash);
-    Json(BlockStorageState::from(&block))
+) -> Result<Json<BlockStorageState>, (StatusCode, String)> {
+    let block = state
+        .read()
+        .await
+        .latest_storage_view
+        .get_block(block_index)
+        .map_err(block_read_response)?;
+    info!(
+        "received storage state request, responding with: {}",
+        block.hash
+    );
+    Ok(Json(BlockStorageState::from(&block)))
 }
 
 async fn get_latest_storage_state<N: NetworkInterface>(
@@ -116,12 +124,20 @@ async fn get_latest_storage_state<N: NetworkInterface>(
 async fn get_block<N: NetworkInterface>(
     State(state): State<SharedState<N>>,
     Path(block_index): Path<u32>,
-) -> Json<BlockFile> {
-    Json(
-        state
-            .read()
-            .await
-            .latest_storage_view
-            .get_block(block_index),
-    )
+) -> Result<Json<BlockFile>, (StatusCode, String)> {
+    let block = state
+        .read()
+        .await
+        .latest_storage_view
+        .get_block(block_index)
+        .map_err(block_read_response)?;
+    Ok(Json(block))
+}
+
+fn block_read_response(error: String) -> (StatusCode, String) {
+    if error.starts_with("Block file not found") {
+        (StatusCode::NOT_FOUND, error)
+    } else {
+        (StatusCode::INTERNAL_SERVER_ERROR, error)
+    }
 }
