@@ -170,7 +170,17 @@ fn block_states_match(states: &[BlockStorageState]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::BlockHash;
+    use crate::crypto::KeyManager;
+    use crate::network::local_network::LocalNetwork;
+    use crate::storage::{BlockHash, BlockStatus};
+    use crate::transactions::{AssetType, Metadata, Operation, SignedTransaction, Transaction};
+    use k256::ecdsa::SigningKey;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static TEST_DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
     #[test]
     fn block_states_match_when_height_and_hash_match() {
@@ -202,5 +212,65 @@ mod tests {
         ];
 
         assert!(!block_states_match(&states));
+    }
+
+    #[tokio::test]
+    async fn local_network_retrieves_missing_block() {
+        let (source_dir, target_dir) = create_test_dirs();
+        let mut source_keeper = BlockKeeper::new(source_dir, 1);
+        let mut target_keeper = BlockKeeper::new(target_dir, 1);
+        let client_key = KeyManager::create_key();
+        let block_hash = create_and_commit_block(&mut source_keeper, &client_key);
+
+        let mut network = LocalNetwork::default();
+        network.add_block_storage_view(PeerId::from(2), source_keeper.create_block_storage_view());
+        let network = Arc::new(network);
+        let mut synchronization = Synchronization::new(network);
+
+        let result = synchronization
+            .check_and_retrieve_missing_blocks(&mut target_keeper)
+            .await;
+
+        assert!(matches!(result, SyncState::SUCCESS));
+        let target_state = target_keeper.get_block_storage_state();
+        let target_state = target_state.read().unwrap();
+        assert_eq!(target_state.block_height, 1);
+        assert_eq!(target_state.last_commited_hash, block_hash);
+    }
+
+    fn create_and_commit_block(
+        block_keeper: &mut BlockKeeper,
+        client_key: &SigningKey,
+    ) -> BlockHash {
+        let transaction = SignedTransaction::new(
+            Transaction {
+                operation: Operation::AddCoin {
+                    amount: 10,
+                    asset_type: AssetType::BTC,
+                },
+                metadata: Metadata {
+                    timestamp_nanos: 100,
+                    sequence_number: 1,
+                },
+            },
+            client_key,
+        );
+        let BlockStatus::NewBlockCreated { block_hash } = block_keeper.add_transaction(transaction)
+        else {
+            panic!("Expected a new block to be created");
+        };
+        block_keeper.commit_block(&block_hash).unwrap();
+        block_hash
+    }
+
+    fn create_test_dirs() -> (PathBuf, PathBuf) {
+        let dir_id = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let base_dir = PathBuf::from("target/test/data/synchronization").join(dir_id.to_string());
+        let source_dir = base_dir.join("source");
+        let target_dir = base_dir.join("target");
+        let _ = fs::remove_dir_all(&base_dir);
+        fs::create_dir_all(&source_dir).expect("Failed to create source dir");
+        fs::create_dir_all(&target_dir).expect("Failed to create target dir");
+        (source_dir, target_dir)
     }
 }
