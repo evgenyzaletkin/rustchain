@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
+pub mod discovery_client;
 pub mod local_network;
 pub mod network_constants;
 pub mod rest_network;
@@ -86,7 +87,7 @@ impl From<&HashMap<PeerId, SocketAddr>> for PeersResponse {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct PeerWithAddr {
     peer_id: PeerId,
     addr: SocketAddr,

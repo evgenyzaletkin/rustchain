@@ -1,4 +1,5 @@
-use crate::network::{NetworkInterface, NetworkMessage, PeersResponse, RegisterRequest};
+use crate::network::discovery_client::{DiscoveryClient, HttpDiscoveryClient};
+use crate::network::{NetworkInterface, NetworkMessage};
 use crate::peer::{Message, MessageBody, PeerId};
 use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderValue, Method};
@@ -18,27 +19,46 @@ pub const TICK_DURATION: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const NETWORK_CHECK_TRIES: usize = 5;
 
-pub struct RestNetwork {
+pub struct RestNetwork<D = HttpDiscoveryClient> {
     peer_id: PeerId,
-    discovery_addr: SocketAddr,
+    discovery_client: D,
     known_peers: RwLock<HashMap<PeerId, SocketAddr>>,
     client: Client,
     peer_sender: Sender<Message>,
     peers_ready: Notify,
 }
 
-impl RestNetwork {
+impl RestNetwork<HttpDiscoveryClient> {
     pub fn new(peer_id: PeerId, peer_sender: Sender<Message>) -> Self {
-        let discovery_port = std::env::var("DISCOVERY_PORT")
-            .ok()
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(3000);
-        let discovery_addr = SocketAddr::from(([127, 0, 0, 1], discovery_port));
+        Self::with_discovery_client(peer_id, peer_sender, HttpDiscoveryClient::from_env())
+    }
+}
+
+impl<D: DiscoveryClient> RestNetwork<D> {
+    pub fn with_discovery_client(
+        peer_id: PeerId,
+        peer_sender: Sender<Message>,
+        discovery_client: D,
+    ) -> Self {
+        Self::with_discovery_client_and_http_client(
+            peer_id,
+            peer_sender,
+            discovery_client,
+            Client::new(),
+        )
+    }
+
+    fn with_discovery_client_and_http_client(
+        peer_id: PeerId,
+        peer_sender: Sender<Message>,
+        discovery_client: D,
+        client: Client,
+    ) -> Self {
         Self {
             peer_id,
-            discovery_addr,
+            discovery_client,
             known_peers: RwLock::new(HashMap::new()),
-            client: Client::new(),
+            client,
             peer_sender,
             peers_ready: Notify::new(),
         }
@@ -58,7 +78,7 @@ impl RestNetwork {
             trace!("Registering with discovery server: try {failed_checks}");
 
             match async {
-                self.register(addr).await?;
+                self.discovery_client.register(self.peer_id, addr).await?;
                 self.update_peers().await
             }
             .await
@@ -78,30 +98,11 @@ impl RestNetwork {
         }
     }
 
-    async fn register(&self, addr: SocketAddr) -> Result<Response, Error> {
-        Self::send_message(
-            self.client.clone(),
-            &NetworkMessage::Register(RegisterRequest {
-                peer_id: self.peer_id,
-                addr,
-            }),
-            &self.discovery_addr,
-        )
-        .await
-    }
-
-    async fn update_peers(&self) -> Result<(), Error> {
-        let result = Self::send_message(
-            self.client.clone(),
-            &NetworkMessage::GetPeers,
-            &self.discovery_addr,
-        )
-        .await?;
-        trace!("Got peers response: {result:?}");
-        let peers_response: PeersResponse = result.json().await?;
+    async fn update_peers(&self) -> Result<(), String> {
+        let peers = self.discovery_client.peers().await?;
         let mut known_peers = self.known_peers.write().unwrap();
         known_peers.clear();
-        for peer in peers_response.peers {
+        for peer in peers {
             if peer.peer_id != self.peer_id {
                 known_peers.insert(peer.peer_id, peer.addr);
             }
@@ -189,7 +190,7 @@ impl RestNetwork {
     }
 }
 
-impl NetworkInterface for RestNetwork {
+impl<D: DiscoveryClient> NetworkInterface for RestNetwork<D> {
     fn send_peer_message(&self, message: Message) {
         let known_peers = self.known_peers.read().unwrap();
         if let Some(addr) = known_peers.get(&message.to).cloned() {
@@ -267,5 +268,54 @@ impl NetworkInterface for RestNetwork {
 
     async fn wait_for_readiness(&self) {
         self.peers_ready.notified().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::network::PeerWithAddr;
+    use std::sync::Mutex;
+    use tokio::sync::mpsc;
+
+    struct FakeDiscoveryClient {
+        peers: Mutex<Vec<PeerWithAddr>>,
+    }
+
+    impl FakeDiscoveryClient {
+        fn new(peers: Vec<PeerWithAddr>) -> Self {
+            Self {
+                peers: Mutex::new(peers),
+            }
+        }
+    }
+
+    impl DiscoveryClient for FakeDiscoveryClient {
+        async fn register(&self, _peer_id: PeerId, _addr: SocketAddr) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn peers(&self) -> Result<Vec<PeerWithAddr>, String> {
+            Ok(self.peers.lock().unwrap().clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn update_peers_uses_discovery_client_and_filters_self() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let client = Client::builder().no_proxy().build().unwrap();
+        let network = RestNetwork::with_discovery_client_and_http_client(
+            PeerId::from(1),
+            sender,
+            FakeDiscoveryClient::new(vec![
+                PeerWithAddr::new(PeerId::from(1), "127.0.0.1:3001".parse().unwrap()),
+                PeerWithAddr::new(PeerId::from(2), "127.0.0.1:3002".parse().unwrap()),
+            ]),
+            client,
+        );
+
+        network.update_peers().await.unwrap();
+
+        assert_eq!(network.known_peers(), vec![PeerId::from(2)]);
     }
 }
