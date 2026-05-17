@@ -1,3 +1,4 @@
+use crate::consensus::{ConsensusOutcome, VotingConsensus};
 use crate::crypto::KeyManager;
 use crate::network::NetworkInterface;
 use crate::peer::MessageBody::{BlockApproved, BlockReject};
@@ -10,7 +11,7 @@ use k256::ecdsa::signature::Signer;
 use k256::ecdsa::{Signature, SigningKey, VerifyingKey};
 use log::debug;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -77,67 +78,12 @@ pub struct Message {
     pub body: MessageBody,
 }
 
-#[derive(Clone, Copy)]
-enum ConsensusResult {
-    InProgress,
-    Approved,
-    Rejected,
-}
-
-struct Consensus {
-    participants: HashSet<PeerId>,
-    approvals: HashSet<PeerId>,
-    rejections: HashSet<PeerId>,
-    consensus_result: Option<ConsensusResult>,
-}
-
-impl Consensus {
-    fn new(peer_id: PeerId, known_peers: &Vec<PeerId>) -> Consensus {
-        let mut participants: HashSet<PeerId> = HashSet::from_iter(known_peers.clone());
-        participants.insert(peer_id);
-        Consensus {
-            approvals: HashSet::with_capacity(participants.len()),
-            rejections: HashSet::with_capacity(participants.len()),
-            participants,
-            consensus_result: None,
-        }
-    }
-
-    fn already_voted(&self, peer_id: &PeerId) -> bool {
-        self.approvals.contains(peer_id) || self.rejections.contains(peer_id)
-    }
-
-    fn make_vote(&mut self, peer_id: PeerId, approve: bool) -> ConsensusResult {
-        if let Some(result) = self.consensus_result {
-            return result;
-        }
-
-        if self.participants.contains(&peer_id) {
-            if approve {
-                self.approvals.insert(peer_id);
-            } else {
-                self.rejections.insert(peer_id);
-            }
-            let total_peers = self.participants.len();
-            let f = (total_peers - 1) / 3;
-            if self.approvals.len() >= 2 * f + 1 {
-                self.consensus_result = Some(ConsensusResult::Approved);
-                return ConsensusResult::Approved;
-            } else if self.rejections.len() >= f {
-                self.consensus_result = Some(ConsensusResult::Rejected);
-                return ConsensusResult::Rejected;
-            }
-        }
-        ConsensusResult::InProgress
-    }
-}
-
 pub struct Peer<N: NetworkInterface> {
     pub id: PeerId,
     receiver: Receiver<Message>,
     transaction_processor: TransactionProcessor,
     block_keeper: BlockKeeper,
-    votings: HashMap<BlockHash, Consensus>,
+    votings: HashMap<BlockHash, VotingConsensus>,
     signing_key: SigningKey,
     public_key: VerifyingKey,
     network: Arc<N>,
@@ -283,7 +229,7 @@ impl<N: NetworkInterface> Peer<N> {
                     self.id,
                 )
             }
-            let mut cons = Consensus::new(self.id, &known_peers);
+            let mut cons = VotingConsensus::new(self.id, &known_peers);
             cons.make_vote(self.id, true);
             self.votings.insert(block_hash, cons);
             Ok(())
@@ -348,21 +294,21 @@ impl<N: NetworkInterface> Peer<N> {
         approve: bool,
     ) -> Result<(), String> {
         let cons = self.get_consensus(block_hash);
-        if !cons.already_voted(&from) && cons.consensus_result.is_none() {
+        if !cons.already_voted(&from) && cons.outcome().is_none() {
             let res = match cons.make_vote(from, approve) {
-                ConsensusResult::Approved => {
+                ConsensusOutcome::Approved => {
                     debug!("Approved block {}", block_hash);
                     self.block_keeper.commit_block(&block_hash)?;
                     self.last_completed_block = block_hash.clone();
                     Some(BlockApproved { block_hash })
                 }
-                ConsensusResult::Rejected => {
+                ConsensusOutcome::Rejected => {
                     debug!("Rejected block {}", block_hash);
                     self.block_keeper.rollback_block(&block_hash)?;
                     self.last_completed_block = block_hash.clone();
                     Some(BlockReject { block_hash })
                 }
-                ConsensusResult::InProgress => None,
+                ConsensusOutcome::Pending => None,
             };
             if let Some(body) = res {
                 self.network.broadcast_peer_message(&body, self.id);
@@ -371,9 +317,9 @@ impl<N: NetworkInterface> Peer<N> {
         Ok(())
     }
 
-    fn get_consensus(&mut self, block_hash: BlockHash) -> &mut Consensus {
+    fn get_consensus(&mut self, block_hash: BlockHash) -> &mut VotingConsensus {
         self.votings
             .entry(block_hash)
-            .or_insert_with(|| Consensus::new(self.id, &self.network.known_peers().clone()))
+            .or_insert_with(|| VotingConsensus::new(self.id, &self.network.known_peers()))
     }
 }

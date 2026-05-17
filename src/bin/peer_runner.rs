@@ -19,7 +19,7 @@ struct PeerConfig {
 impl PeerConfig {
     fn from_env() -> Result<PeerConfig, String> {
         let peer_id: PeerId = std::env::var(PEER_ID_ENV_VAR)
-            .map_err(|e| e.to_string())?
+            .map_err(|e| "PEER_ID must be specified")?
             .parse()
             .map_err(|_| "Peer Id must be a number")?;
 

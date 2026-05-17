@@ -4,7 +4,7 @@ use crate::transactions::SignedTransaction;
 use derive_more::Display;
 use k256::ecdsa::{Signature, VerifyingKey, signature};
 use k256::sha2::{Digest, Sha256};
-use log::{info};
+use log::info;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sorted_vec::SortedVec;
@@ -101,10 +101,7 @@ impl BlockFile {
         })
     }
 
-    fn read_from_disk_by_index(
-        path_to_blocks: &PathBuf,
-        index: u32,
-    ) -> Result<Self, String> {
+    fn read_from_disk_by_index(path_to_blocks: &PathBuf, index: u32) -> Result<Self, String> {
         Self::read_from_disk(&path_to_blocks.join(BlockFile::block_filename_for_index(index)))
     }
 

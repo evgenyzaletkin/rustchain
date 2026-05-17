@@ -102,9 +102,10 @@ impl NetworkInterface for LocalNetwork {
             .ok_or_else(|| "Peer storage view not found".to_string())?;
         match message_body {
             NetworkMessage::GetLatestBlockState => deserialize_response(view.get_latest_state()),
-            NetworkMessage::GetBlockState(idx) => {
-                deserialize_response(view.get_block(idx).map(|block| BlockStorageState::from(&block))?)
-            }
+            NetworkMessage::GetBlockState(idx) => deserialize_response(
+                view.get_block(idx)
+                    .map(|block| BlockStorageState::from(&block))?,
+            ),
             NetworkMessage::GetBlock(idx) => deserialize_response(view.get_block(idx)?),
             _ => Err("Unsupported local network request".to_string()),
         }

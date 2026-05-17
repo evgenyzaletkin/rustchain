@@ -1,8 +1,9 @@
+mod consensus;
 pub mod crypto;
+pub mod logging;
 pub mod network;
 pub mod peer;
-pub mod storage;
-pub mod transactions;
 pub mod server;
-pub mod logging;
+pub mod storage;
 mod synchronization;
+pub mod transactions;
