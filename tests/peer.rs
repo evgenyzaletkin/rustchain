@@ -1,16 +1,20 @@
 #[cfg(test)]
 mod tests {
     use k256::ecdsa::SigningKey;
+    use rustchain::consensus::{ConsensusEngine, ConsensusInput};
     use rustchain::crypto::KeyManager;
+    use rustchain::network::NetworkInterface;
     use rustchain::network::local_network::LocalNetwork;
     use rustchain::peer::{Message, MessageBody, Peer, PeerId};
     use rustchain::storage::BlockKeeper;
-    use rustchain::transactions::{AssetType, Metadata, Operation, SignedTransaction, Transaction};
+    use rustchain::transactions::{
+        AssetType, Metadata, Operation, SignedTransaction, Transaction, VerifiedTransaction,
+    };
     use std::fs;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
     use tokio::sync::mpsc;
 
     const TEST_DATA_PATH: &str = "target/test/data";
@@ -143,18 +147,211 @@ mod tests {
         assert_eq!(network.get_broadcasted_messages().len(), 3);
     }
 
+    #[tokio::test]
+    async fn test_raft_election_request_is_broadcast() {
+        let mut network = LocalNetwork::default();
+        network.add_known_peer(PeerId::from(2));
+        network.add_known_peer(PeerId::from(3));
+        let network = Arc::new(network);
+        let mut peer = create_raft_peer(PeerId::from(1), network.clone(), 1);
+
+        tick_consensus(
+            &mut peer,
+            &network,
+            Instant::now() + Duration::from_secs(60),
+        );
+
+        let broadcasted_messages = network.get_broadcasted_messages();
+        assert_eq!(broadcasted_messages.len(), 1);
+        assert!(matches!(
+            broadcasted_messages[0],
+            MessageBody::RaftRequestVote {
+                term: 1,
+                candidate_id,
+            } if candidate_id == PeerId::from(1)
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_raft_vote_response_is_sent_to_candidate() {
+        let (candidate_sender, mut candidate_receiver) = mpsc::channel(1000);
+        let mut network = LocalNetwork::default();
+        network.add_peer(PeerId::from(2), candidate_sender);
+        let network = Arc::new(network);
+        let mut peer = create_raft_peer(PeerId::from(1), network.clone(), 1);
+        tick_consensus(&mut peer, &network, Instant::now());
+
+        peer.handle_message(Message {
+            from: PeerId::from(2),
+            to: PeerId::from(1),
+            body: MessageBody::RaftRequestVote {
+                term: 1,
+                candidate_id: PeerId::from(2),
+            },
+        });
+
+        let response = candidate_receiver.try_recv().unwrap();
+        assert_eq!(response.from, PeerId::from(1));
+        assert_eq!(response.to, PeerId::from(2));
+        assert!(matches!(
+            response.body,
+            MessageBody::RaftRequestVoteResponse {
+                term: 1,
+                vote_granted: true,
+            }
+        ));
+        assert!(network.get_broadcasted_messages().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_raft_follower_forwards_valid_client_transaction_to_leader() {
+        let (leader_sender, mut leader_receiver) = mpsc::channel(1000);
+        let mut network = LocalNetwork::default();
+        network.add_peer(PeerId::from(2), leader_sender);
+        let network = Arc::new(network);
+        let mut peer = create_raft_peer(PeerId::from(1), network.clone(), 1);
+        tick_consensus(&mut peer, &network, Instant::now());
+
+        peer.handle_message(Message {
+            from: PeerId::from(2),
+            to: PeerId::from(1),
+            body: MessageBody::RaftAppendEntries {
+                term: 1,
+                leader_id: PeerId::from(2),
+            },
+        });
+
+        let client_key = KeyManager::create_key();
+        let transaction = create_test_transaction(&client_key);
+        peer.handle_message(Message {
+            from: PeerId::from(0),
+            to: PeerId::from(1),
+            body: MessageBody::ClientTransaction(transaction.clone()),
+        });
+
+        let forwarded = leader_receiver.try_recv().unwrap();
+        assert_eq!(forwarded.from, PeerId::from(1));
+        assert_eq!(forwarded.to, PeerId::from(2));
+        assert!(matches!(
+            forwarded.body,
+            MessageBody::ClientTransaction(client_transaction)
+                if client_transaction == transaction
+        ));
+        assert!(network.get_broadcasted_messages().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_raft_follower_does_not_propose_block_from_synchronized_transaction() {
+        let mut network = LocalNetwork::default();
+        network.add_known_peer(PeerId::from(2));
+        let network = Arc::new(network);
+        let mut peer = create_raft_peer(PeerId::from(1), network.clone(), 1);
+        tick_consensus(&mut peer, &network, Instant::now());
+
+        peer.handle_message(Message {
+            from: PeerId::from(2),
+            to: PeerId::from(1),
+            body: MessageBody::RaftAppendEntries {
+                term: 1,
+                leader_id: PeerId::from(2),
+            },
+        });
+
+        let client_key = KeyManager::create_key();
+        let leader_key = KeyManager::create_key();
+        let transaction = create_test_transaction(&client_key);
+        let verified_transaction = VerifiedTransaction::new(transaction, &leader_key);
+        peer.handle_message(Message {
+            from: PeerId::from(2),
+            to: PeerId::from(1),
+            body: MessageBody::Synchronization(verified_transaction),
+        });
+
+        assert!(
+            !network
+                .get_broadcasted_messages()
+                .iter()
+                .any(|message| matches!(message, MessageBody::BlockProposal { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_raft_leader_processes_client_transaction_locally() {
+        let mut network = LocalNetwork::default();
+        network.add_known_peer(PeerId::from(2));
+        network.add_known_peer(PeerId::from(3));
+        let network = Arc::new(network);
+        let mut peer = create_raft_peer(PeerId::from(1), network.clone(), 2);
+
+        tick_consensus(
+            &mut peer,
+            &network,
+            Instant::now() + Duration::from_secs(60),
+        );
+        peer.handle_message(Message {
+            from: PeerId::from(2),
+            to: PeerId::from(1),
+            body: MessageBody::RaftRequestVoteResponse {
+                term: 1,
+                vote_granted: true,
+            },
+        });
+
+        let client_key = KeyManager::create_key();
+        let transaction = create_test_transaction(&client_key);
+        peer.handle_message(Message {
+            from: PeerId::from(0),
+            to: PeerId::from(1),
+            body: MessageBody::ClientTransaction(transaction.clone()),
+        });
+
+        let broadcasted_messages = network.get_broadcasted_messages();
+        assert_eq!(broadcasted_messages.len(), 2);
+        assert!(matches!(
+            &broadcasted_messages[0],
+            MessageBody::RaftRequestVote { .. }
+        ));
+        assert!(broadcasted_messages.iter().any(|msg_body| {
+            matches!(msg_body, MessageBody::Synchronization(verified_transaction) if verified_transaction.client_tx == transaction)
+        }));
+    }
+
     fn create_peer(peer_id: PeerId, network: Arc<LocalNetwork>, size: usize) -> Peer<LocalNetwork> {
-        let (_, receiver) = mpsc::channel(1000);
         let dir_id = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
         let peer_1_dir = PathBuf::from(TEST_DATA_PATH).join(format!("peer_test_{}", dir_id));
         recreate_dir(&peer_1_dir);
-        Peer::<LocalNetwork>::create_with_storage(
+        Peer::<LocalNetwork>::new(
             peer_id,
-            receiver,
-            peer_1_dir.clone(),
-            BlockKeeper::new(peer_1_dir.clone(), size),
             network.clone(),
+            ConsensusEngine::new_voting(peer_id),
+            BlockKeeper::new(peer_1_dir.clone(), size),
+            KeyManager::get_or_create_key(&peer_1_dir),
         )
+    }
+
+    fn create_raft_peer(
+        peer_id: PeerId,
+        network: Arc<LocalNetwork>,
+        size: usize,
+    ) -> Peer<LocalNetwork> {
+        let dir_id = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let peer_1_dir = PathBuf::from(TEST_DATA_PATH).join(format!("peer_test_{}", dir_id));
+        recreate_dir(&peer_1_dir);
+        Peer::<LocalNetwork>::new(
+            peer_id,
+            network.clone(),
+            ConsensusEngine::new_raft(peer_id),
+            BlockKeeper::new(peer_1_dir.clone(), size),
+            KeyManager::get_or_create_key(&peer_1_dir),
+        )
+    }
+
+    fn tick_consensus(peer: &mut Peer<LocalNetwork>, network: &Arc<LocalNetwork>, now: Instant) {
+        peer.handle_consensus_input(ConsensusInput::Tick {
+            now,
+            known_peers: network.known_peers(),
+        })
+        .unwrap();
     }
 
     fn recreate_dir(path: &PathBuf) {

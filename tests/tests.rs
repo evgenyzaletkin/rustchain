@@ -4,6 +4,7 @@ mod tests {
     use k256::ecdsa::SigningKey;
     use k256::ecdsa::signature::Verifier;
     use k256::ecdsa::{Signature, VerifyingKey};
+    use rustchain::consensus::ConsensusEngine;
     use rustchain::crypto::KeyManager;
     use rustchain::network::local_network::LocalNetwork;
     use rustchain::peer::{Peer, PeerId};
@@ -14,7 +15,6 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::sync::Arc;
-    use tokio::sync::mpsc;
 
     const TEST_DATA_PATH: &str = "target/test/data";
 
@@ -82,17 +82,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_block_verification() {
-        let (_send1, recv1) = mpsc::channel(1000);
         let peer_1_dir = PathBuf::from(TEST_DATA_PATH).join("block_verification_peer");
         recreate_dir(&peer_1_dir);
 
         let mut block_keeper = BlockKeeper::new(peer_1_dir.clone(), 1);
-        let _peer_1 = Peer::create_with_storage(
+        let network = Arc::new(LocalNetwork::default());
+        let _peer_1 = Peer::new(
             PeerId::new(1),
-            recv1,
-            peer_1_dir.clone(),
+            network.clone(),
+            ConsensusEngine::new_voting(PeerId::new(1)),
             BlockKeeper::new(peer_1_dir.clone(), 1),
-            Arc::new(LocalNetwork::default()),
+            KeyManager::get_or_create_key(&peer_1_dir),
         );
 
         // Create and add a transaction

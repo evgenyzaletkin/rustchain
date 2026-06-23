@@ -1,6 +1,6 @@
-pub const DEFAULT_CHANNEL_SIZE: usize = 1000;
-pub const BASE_PORT: u16 = 3000;
-pub const LOCAL_HOST: [u8; 4] = [127, 0, 0, 1];
+pub use crate::config::{
+    DEFAULT_BASE_PORT as BASE_PORT, DEFAULT_CHANNEL_SIZE, DEFAULT_LOCAL_HOST as LOCAL_HOST,
+};
 pub const REGISTER_PATH: &str = "/register";
 pub const GET_PEERS_PATH: &str = "/peers";
 pub const HANDLE_PEER_MESSAGE_PATH: &str = "/handle";

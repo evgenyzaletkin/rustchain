@@ -1,9 +1,11 @@
-mod consensus;
+pub mod config;
+pub mod consensus;
 pub mod crypto;
 pub mod logging;
 pub mod network;
 pub mod peer;
+pub mod peer_runtime;
 pub mod server;
 pub mod storage;
-mod synchronization;
+pub mod synchronization;
 pub mod transactions;

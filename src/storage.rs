@@ -14,8 +14,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, RwLock};
 use std::{fmt, fs, mem};
 
-pub const DEFAULT_PATH_TO_BLOCKS: &str = "data";
-pub const DEFAULT_MEMPOOL_SIZE: usize = 5;
+pub use crate::config::{DEFAULT_MEMPOOL_SIZE, DEFAULT_PATH_TO_BLOCKS};
 pub const EMPTY_HASH: BlockHash = BlockHash([0; 32]);
 const BLOCK_PATTERN: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(\d+)\.block$").unwrap());
 

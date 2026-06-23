@@ -9,11 +9,6 @@ use rand::seq::IndexedRandom;
 use std::cmp::min;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::time;
-use tokio::time::Interval;
-
-const SYNC_INTERVAL: Duration = Duration::from_secs(20);
 
 pub enum SyncState {
     SUCCESS,
@@ -57,10 +52,6 @@ impl<N: NetworkInterface> Synchronization<N> {
             network,
             rng: rand::rng(),
         }
-    }
-
-    pub async fn create_interval(&mut self) -> Interval {
-        time::interval(SYNC_INTERVAL)
     }
 
     pub async fn check_and_retrieve_missing_blocks(
