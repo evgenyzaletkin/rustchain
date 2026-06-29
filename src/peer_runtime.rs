@@ -3,10 +3,11 @@ use crate::config::{
     DEFAULT_CONSENSUS_TICK_INTERVAL, DEFAULT_LOCAL_HOST, DEFAULT_MEMPOOL_SIZE,
     DEFAULT_PATH_TO_BLOCKS, DEFAULT_SYNC_INTERVAL, PEER_ID_ENV_VAR,
 };
-use crate::consensus::{ConsensusEngine, ConsensusInput};
 use crate::crypto::KeyManager;
 use crate::network::NetworkInterface;
 use crate::network::rest_network::RestNetwork;
+use crate::peer::consensus::raft_log_store::FileRaftLogStore;
+use crate::peer::consensus::{ConsensusEngine, ConsensusInput};
 use crate::peer::{Peer, PeerId};
 use crate::server;
 use crate::storage::{BlockKeeper, BlockStorageView};
@@ -56,7 +57,7 @@ impl PeerConfig {
             .parse()
             .map_err(|_| "Peer Id must be a number")?;
         let consensus_mode = std::env::var(CONSENSUS_MODE_ENV_VAR)
-            .unwrap_or_else(|_| "voting".to_string())
+            .unwrap_or_else(|_| "raft".to_string())
             .parse()?;
 
         let port_offset: u16 = peer_id.try_into()?;
@@ -80,10 +81,13 @@ pub async fn run_peer(peer_config: PeerConfig) -> Result<(), String> {
     let block_keeper = BlockKeeper::new(peer_dir.clone(), DEFAULT_MEMPOOL_SIZE);
     let view = create_block_storage_view(&block_keeper);
     let signing_key = KeyManager::get_or_create_key(&peer_dir);
-    let mut synchronization = Synchronization::new(network.clone());
+    let mut synchronization = (peer_config.consensus_mode == ConsensusMode::Voting)
+        .then(|| Synchronization::new(network.clone()));
     let consensus = match peer_config.consensus_mode {
         ConsensusMode::Voting => ConsensusEngine::new_voting(peer_config.peer_id),
-        ConsensusMode::Raft => ConsensusEngine::new_raft(peer_config.peer_id),
+        ConsensusMode::Raft => {
+            create_raft_consensus(peer_config.peer_id, &peer_dir, &block_keeper)?
+        }
     };
     let requires_consensus_tick = consensus.requires_tick();
     let mut peer = Peer::new(
@@ -111,7 +115,9 @@ pub async fn run_peer(peer_config: PeerConfig) -> Result<(), String> {
 
     network.wait_for_readiness().await;
     let mut receiver = receiver;
-    let mut sync_interval = time::interval(DEFAULT_SYNC_INTERVAL);
+    let mut sync_interval = synchronization
+        .as_ref()
+        .map(|_| time::interval(DEFAULT_SYNC_INTERVAL));
     let mut consensus_interval =
         requires_consensus_tick.then(|| time::interval(DEFAULT_CONSENSUS_TICK_INTERVAL));
     loop {
@@ -120,12 +126,14 @@ pub async fn run_peer(peer_config: PeerConfig) -> Result<(), String> {
                 let message = message.ok_or_else(|| "Channel is closed".to_string())?;
                 peer.handle_message(message);
             },
-            _ = sync_interval.tick() => {
-                synchronization
-                    .check_and_retrieve_missing_blocks(peer.block_keeper_mut())
-                    .await;
+            _ = next_interval_tick(&mut sync_interval) => {
+                if let Some(synchronization) = synchronization.as_mut() {
+                    synchronization
+                        .check_and_retrieve_missing_blocks(peer.block_keeper_mut())
+                        .await;
+                }
             },
-            _ = next_consensus_tick(&mut consensus_interval) => {
+            _ = next_interval_tick(&mut consensus_interval) => {
                 peer.handle_consensus_input(ConsensusInput::Tick {
                     now: Instant::now(),
                     known_peers: network.known_peers(),
@@ -135,8 +143,8 @@ pub async fn run_peer(peer_config: PeerConfig) -> Result<(), String> {
     }
 }
 
-async fn next_consensus_tick(consensus_interval: &mut Option<Interval>) {
-    match consensus_interval {
+async fn next_interval_tick(interval: &mut Option<Interval>) {
+    match interval {
         Some(interval) => {
             interval.tick().await;
         }
@@ -146,6 +154,20 @@ async fn next_consensus_tick(consensus_interval: &mut Option<Interval>) {
 
 fn create_block_storage_view(block_keeper: &BlockKeeper) -> BlockStorageView {
     block_keeper.create_block_storage_view()
+}
+
+fn create_raft_consensus(
+    peer_id: PeerId,
+    peer_dir: &PathBuf,
+    block_keeper: &BlockKeeper,
+) -> Result<ConsensusEngine, String> {
+    let raft_log_store = FileRaftLogStore::new(peer_dir);
+    let commit_index = block_keeper
+        .get_block_storage_state()
+        .read()
+        .map_err(|e| format!("Failed to read block storage state: {}", e))?
+        .block_height as u64;
+    ConsensusEngine::new_raft_with_storage(peer_id, Box::new(raft_log_store), commit_index)
 }
 
 #[cfg(test)]

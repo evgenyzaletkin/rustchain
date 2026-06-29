@@ -1,6 +1,6 @@
-use crate::consensus::{ConsensusInput, ConsensusOutput};
 use crate::peer::MessageBody;
 use crate::peer::PeerId;
+use crate::peer::consensus::{ConsensusAction, ConsensusInput};
 use crate::storage::BlockHash;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -70,13 +70,16 @@ pub fn handle_voting_input(
     peer_id: PeerId,
     votings: &mut HashMap<BlockHash, VotingConsensus>,
     input: ConsensusInput,
-) -> Vec<ConsensusOutput> {
+) -> Vec<ConsensusAction> {
     match input {
         ConsensusInput::ClientTransactionReceived(client_tx) => {
-            vec![ConsensusOutput::ApplyClientTransaction(client_tx)]
+            vec![
+                ConsensusAction::StageClientTransaction(client_tx.clone()),
+                ConsensusAction::BroadcastClientTransaction(client_tx),
+            ]
         }
         ConsensusInput::NewBlockCreated { block_hash } => {
-            vec![ConsensusOutput::ProposeBlock(block_hash)]
+            vec![ConsensusAction::ProposeBlock(block_hash)]
         }
         ConsensusInput::LocalBlockProposed {
             block_hash,
@@ -116,6 +119,7 @@ pub fn handle_voting_input(
         ConsensusInput::Tick { .. }
         | ConsensusInput::RaftRequestVote { .. }
         | ConsensusInput::RaftRequestVoteResponse { .. }
+        | ConsensusInput::RaftAppendEntriesResponse { .. }
         | ConsensusInput::RaftAppendEntries { .. } => Vec::new(),
     }
 }
@@ -127,7 +131,7 @@ fn handle_voting_vote(
     block_hash: BlockHash,
     from: PeerId,
     approve: bool,
-) -> Vec<ConsensusOutput> {
+) -> Vec<ConsensusAction> {
     let consensus = votings
         .entry(block_hash)
         .or_insert_with(|| VotingConsensus::new(peer_id, known_peers));
@@ -138,12 +142,12 @@ fn handle_voting_vote(
 
     match consensus.make_vote(from, approve) {
         ConsensusOutcome::Approved => vec![
-            ConsensusOutput::CommitBlock(block_hash),
-            ConsensusOutput::Broadcast(MessageBody::BlockApproved { block_hash }),
+            ConsensusAction::CommitBlock(block_hash),
+            ConsensusAction::Broadcast(MessageBody::BlockApproved { block_hash }),
         ],
         ConsensusOutcome::Rejected => vec![
-            ConsensusOutput::RollbackBlock(block_hash),
-            ConsensusOutput::Broadcast(MessageBody::BlockReject { block_hash }),
+            ConsensusAction::RollbackBlock(block_hash),
+            ConsensusAction::Broadcast(MessageBody::BlockReject { block_hash }),
         ],
         ConsensusOutcome::Pending => Vec::new(),
     }

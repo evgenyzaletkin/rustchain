@@ -107,6 +107,34 @@ impl BlockFile {
     fn block_filename_for_index(index: u32) -> String {
         format!("{:05}.block", index)
     }
+
+    pub fn verify_block_vec(
+        block_hash: BlockHash,
+        block_file_vec: &Vec<u8>,
+        signature: Signature,
+        public_key: VerifyingKey,
+    ) -> Result<Self, BlockVerificationError> {
+        KeyManager::verify_message(&public_key, &signature, block_file_vec)?;
+        let block_file: BlockFile = block_file_vec.into();
+        if block_hash != block_file.hash {
+            return Err(BlockVerificationError::InvalidBlockHash);
+        }
+        block_file.verify_block()?;
+        Ok(block_file)
+    }
+
+    pub fn verify_block(&self) -> Result<(), BlockVerificationError> {
+        let calculated_hash = Self::calculate_hash(&self.transactions, &self.previous_hash);
+        if calculated_hash != self.hash {
+            info!(
+                "recalculated_hash: {} is different from received hash: {}",
+                calculated_hash, self.hash
+            );
+            return Err(BlockVerificationError::InvalidBlockHash);
+        }
+        // verify transactions
+        Ok(())
+    }
 }
 
 impl Signable for BlockFile {}
@@ -250,7 +278,7 @@ impl BlockKeeper {
         &mut self,
         block_file: BlockFile,
     ) -> Result<(), BlockVerificationError> {
-        self.verify_block(&block_file)?;
+        block_file.verify_block()?;
         for transaction in block_file.transactions.iter() {
             if let Some(transaction) = self.mempool.remove(&transaction.tx_id()) {
                 self.pending_transactions
@@ -301,6 +329,12 @@ impl BlockKeeper {
         self.uncommited_blocks.get(block_hash)
     }
 
+    pub fn read_block_by_index(&self, index: u64) -> Result<BlockFile, String> {
+        let index = u32::try_from(index)
+            .map_err(|_| format!("Block index {} is too large to read from disk", index))?;
+        BlockFile::read_from_disk_by_index(&self.path_to_blocks, index)
+    }
+
     pub fn read_transactions_from_disk(
         &self,
         block_filename: &str,
@@ -313,41 +347,19 @@ impl BlockKeeper {
     }
 
     pub fn block_can_be_added(&self, block_file: &BlockFile) -> bool {
-        !self.uncommited_blocks.contains_key(&block_file.hash)
-            && self.block_storage_state.read().unwrap().block_height == block_file.index - 1
-    }
+        let storage_state = self.block_storage_state.read().unwrap();
+        if self.uncommited_blocks.contains_key(&block_file.hash) {
+            return false;
+        }
 
-    pub fn verify_block_vec(
-        &self,
-        block_hash: BlockHash,
-        block_file_vec: &Vec<u8>,
-        signature: Signature,
-        public_key: VerifyingKey,
-    ) -> Result<BlockFile, BlockVerificationError> {
-        KeyManager::verify_message(&public_key, &signature, block_file_vec)?;
-        let block_file: BlockFile = block_file_vec.into();
-        if block_hash != block_file.hash {
-            return Err(BlockVerificationError::InvalidBlockHash);
+        if storage_state.block_height == block_file.index - 1 {
+            return block_file.previous_hash == storage_state.last_commited_hash;
         }
-        self.verify_block(&block_file)?;
-        Ok(block_file)
-    }
 
-    fn verify_block(&self, block_file: &BlockFile) -> Result<(), BlockVerificationError> {
-        let calculated_hash =
-            BlockFile::calculate_hash(&block_file.transactions, &block_file.previous_hash);
-        if calculated_hash != block_file.hash {
-            info!(
-                "recalculated_hash: {} is different from received hash: {}",
-                calculated_hash, block_file.hash
-            );
-            return Err(BlockVerificationError::InvalidBlockHash);
-        }
-        if block_file.previous_hash != self.block_storage_state.read().unwrap().last_commited_hash {
-            return Err(BlockVerificationError::InvalidPreviousHash);
-        }
-        // verify transactions
-        Ok(())
+        self.uncommited_blocks
+            .values()
+            .find(|uncommited_block| uncommited_block.index + 1 == block_file.index)
+            .is_some_and(|previous_block| block_file.previous_hash == previous_block.hash)
     }
 }
 

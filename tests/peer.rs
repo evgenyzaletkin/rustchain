@@ -218,6 +218,10 @@ mod tests {
             body: MessageBody::RaftAppendEntries {
                 term: 1,
                 leader_id: PeerId::from(2),
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: Vec::new(),
+                leader_commit: 0,
             },
         });
 
@@ -229,14 +233,19 @@ mod tests {
             body: MessageBody::ClientTransaction(transaction.clone()),
         });
 
-        let forwarded = leader_receiver.try_recv().unwrap();
-        assert_eq!(forwarded.from, PeerId::from(1));
-        assert_eq!(forwarded.to, PeerId::from(2));
-        assert!(matches!(
-            forwarded.body,
-            MessageBody::ClientTransaction(client_transaction)
-                if client_transaction == transaction
-        ));
+        let received_messages = vec![
+            leader_receiver.try_recv().unwrap(),
+            leader_receiver.try_recv().unwrap(),
+        ];
+        assert!(received_messages.iter().any(|message| {
+            message.from == PeerId::from(1)
+                && message.to == PeerId::from(2)
+                && matches!(
+                    &message.body,
+                    MessageBody::ClientTransaction(client_transaction)
+                        if *client_transaction == transaction
+                )
+        }));
         assert!(network.get_broadcasted_messages().is_empty());
     }
 
@@ -254,6 +263,10 @@ mod tests {
             body: MessageBody::RaftAppendEntries {
                 term: 1,
                 leader_id: PeerId::from(2),
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries: Vec::new(),
+                leader_commit: 0,
             },
         });
 
@@ -261,6 +274,32 @@ mod tests {
         let leader_key = KeyManager::create_key();
         let transaction = create_test_transaction(&client_key);
         let verified_transaction = VerifiedTransaction::new(transaction, &leader_key);
+        peer.handle_message(Message {
+            from: PeerId::from(2),
+            to: PeerId::from(1),
+            body: MessageBody::Synchronization(verified_transaction),
+        });
+
+        assert!(
+            !network
+                .get_broadcasted_messages()
+                .iter()
+                .any(|message| matches!(message, MessageBody::BlockProposal { .. }))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_synchronized_transaction_is_validated_before_mempool() {
+        let mut network = LocalNetwork::default();
+        network.add_known_peer(PeerId::from(2));
+        let network = Arc::new(network);
+        let mut peer = create_peer(PeerId::from(1), network.clone(), 1);
+
+        let client_key = KeyManager::create_key();
+        let peer_key = KeyManager::create_key();
+        let transaction = create_invalid_send_transaction(&client_key);
+        let verified_transaction = VerifiedTransaction::new(transaction, &peer_key);
+
         peer.handle_message(Message {
             from: PeerId::from(2),
             to: PeerId::from(1),
@@ -306,13 +345,91 @@ mod tests {
         });
 
         let broadcasted_messages = network.get_broadcasted_messages();
-        assert_eq!(broadcasted_messages.len(), 2);
+        assert_eq!(broadcasted_messages.len(), 1);
         assert!(matches!(
             &broadcasted_messages[0],
             MessageBody::RaftRequestVote { .. }
         ));
-        assert!(broadcasted_messages.iter().any(|msg_body| {
-            matches!(msg_body, MessageBody::Synchronization(verified_transaction) if verified_transaction.client_tx == transaction)
+        assert!(
+            !broadcasted_messages
+                .iter()
+                .any(|msg_body| { matches!(msg_body, MessageBody::Synchronization(_)) })
+        );
+    }
+
+    #[tokio::test]
+    async fn test_raft_leader_replicates_created_block_with_append_entries() {
+        let (peer_2_sender, mut peer_2_receiver) = mpsc::channel(1000);
+        let (peer_3_sender, mut peer_3_receiver) = mpsc::channel(1000);
+        let mut network = LocalNetwork::default();
+        network.add_peer(PeerId::from(2), peer_2_sender);
+        network.add_peer(PeerId::from(3), peer_3_sender);
+        let network = Arc::new(network);
+        let mut peer = create_raft_peer(PeerId::from(1), network.clone(), 1);
+
+        tick_consensus(
+            &mut peer,
+            &network,
+            Instant::now() + Duration::from_secs(60),
+        );
+        peer.handle_message(Message {
+            from: PeerId::from(2),
+            to: PeerId::from(1),
+            body: MessageBody::RaftRequestVoteResponse {
+                term: 1,
+                vote_granted: true,
+            },
+        });
+
+        let client_key = KeyManager::create_key();
+        let transaction = create_test_transaction(&client_key);
+        peer.handle_message(Message {
+            from: PeerId::from(0),
+            to: PeerId::from(1),
+            body: MessageBody::ClientTransaction(transaction),
+        });
+
+        let peer_2_messages = vec![
+            peer_2_receiver.try_recv().unwrap(),
+            peer_2_receiver.try_recv().unwrap(),
+        ];
+        let peer_3_messages = vec![
+            peer_3_receiver.try_recv().unwrap(),
+            peer_3_receiver.try_recv().unwrap(),
+        ];
+        assert!(peer_2_messages.iter().any(|message| matches!(
+            &message.body,
+            MessageBody::RaftAppendEntries {
+                term: 1,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries,
+                leader_commit: 0,
+                ..
+            } if entries.len() == 1
+                && entries[0].entry.term == 1
+                && entries[0].entry.index == 1
+                && !entries[0].block_file.is_empty()
+        )));
+        assert!(peer_3_messages.iter().any(|message| matches!(
+            &message.body,
+            MessageBody::RaftAppendEntries {
+                term: 1,
+                prev_log_index: 0,
+                prev_log_term: 0,
+                entries,
+                leader_commit: 0,
+                ..
+            } if entries.len() == 1
+                && entries[0].entry.term == 1
+                && entries[0].entry.index == 1
+                && !entries[0].block_file.is_empty()
+        )));
+        assert!(!network.get_broadcasted_messages().iter().any(|message| {
+            matches!(
+                message,
+                MessageBody::RaftAppendEntries { .. } | MessageBody::BlockProposal { .. }
+            )
         }));
     }
 
@@ -362,6 +479,26 @@ mod tests {
     fn create_test_transaction(signing_key: &SigningKey) -> SignedTransaction {
         let transaction = Transaction {
             operation: Operation::AddCoin {
+                asset_type: AssetType::USDT,
+                amount: 10,
+            },
+            metadata: Metadata {
+                timestamp_nanos: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+                sequence_number: 1,
+            },
+        };
+
+        SignedTransaction::new(transaction, signing_key)
+    }
+
+    fn create_invalid_send_transaction(signing_key: &SigningKey) -> SignedTransaction {
+        let recipient_key = KeyManager::create_key();
+        let transaction = Transaction {
+            operation: Operation::Send {
+                recipient: KeyManager::to_string_hex(&recipient_key.verifying_key()),
                 asset_type: AssetType::USDT,
                 amount: 10,
             },
