@@ -5,7 +5,9 @@ use crate::config::{
 use crate::peer::MessageBody;
 use crate::peer::PeerId;
 use crate::peer::consensus::raft_log_store::{InMemoryRaftLogStore, RaftLogStorage};
-use crate::peer::consensus::{ConsensusAction, ConsensusInput, RaftLogEntry};
+use crate::peer::consensus::{
+    ConsensusAction, ConsensusInput, ConsensusState, RaftLogEntry, RaftRoleState,
+};
 use crate::storage::BlockHash;
 use crate::transactions::SignedTransaction;
 use rand::Rng;
@@ -164,6 +166,21 @@ impl RaftConsensus {
             commit_index,
             raft_log_store,
         ))
+    }
+
+    pub(super) fn state(&self) -> ConsensusState {
+        let role = match self.role {
+            RaftRole::Follower => RaftRoleState::Follower,
+            RaftRole::Candidate => RaftRoleState::Candidate,
+            RaftRole::Leader => RaftRoleState::Leader,
+        };
+        ConsensusState::Raft {
+            role,
+            term: self.current_term,
+            leader_id: self.leader_id,
+            commit_index: self.commit_index,
+            last_log_index: self.last_log_index(),
+        }
     }
 
     fn new_with_log(

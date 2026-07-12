@@ -34,8 +34,8 @@ Consensus is isolated from peer side effects:
 
 Supported modes:
 
+- `raft`: (default) leader election, heartbeats, leader tracking, client transaction forwarding, bounded log replication, persisted Raft log entries, follower match indexes, and majority commit advancement.
 - `voting`: block proposal and approval/rejection by peer votes.
-- `raft`: leader election, heartbeats, leader tracking, client transaction forwarding, bounded log replication, persisted Raft log entries, follower match indexes, and majority commit advancement.
 
 Raft log replication is implemented, but it is still a first-pass implementation. Current limitations include: `current_term` and `voted_for` are not persisted, snapshots are not implemented, conflict optimization is simplified, and membership is still based on known peers rather than formal Raft configuration changes.
 

@@ -5,5 +5,6 @@ pub const REGISTER_PATH: &str = "/register";
 pub const GET_PEERS_PATH: &str = "/peers";
 pub const HANDLE_PEER_MESSAGE_PATH: &str = "/handle";
 pub const LATEST_BLOCK_STATE_PATH: &str = "/block/state/latest";
+pub const PEER_STATE_PATH: &str = "/peer/state";
 pub const TRANSACTIONS_PATH: &str = "/transactions";
 pub const TEST_TRANSACTIONS_PATH: &str = "/test/transactions";

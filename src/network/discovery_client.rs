@@ -1,15 +1,14 @@
+use crate::config::{DISCOVERY_HOST_ENV_VAR, DISCOVERY_PORT_ENV_VAR};
 use crate::network::{NetworkMessage, PeerWithAddr, PeersResponse, RegisterRequest};
 use crate::peer::PeerId;
 use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderValue, Method};
 use log::trace;
 use reqwest::Client;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-const DISCOVERY_ENV: &str = "DISCOVERY_PORT";
-
 #[allow(async_fn_in_trait)]
 pub trait DiscoveryClient: Send + Sync + 'static {
     async fn register(&self, peer_id: PeerId, addr: SocketAddr) -> Result<(), String>;
@@ -17,25 +16,27 @@ pub trait DiscoveryClient: Send + Sync + 'static {
 }
 
 pub struct HttpDiscoveryClient {
-    discovery_addr: SocketAddr,
+    discovery_base_url: String,
     client: Client,
 }
 
 impl HttpDiscoveryClient {
     pub fn from_env() -> Self {
-        let discovery_port = std::env::var(DISCOVERY_ENV)
+        let discovery_host = std::env::var(DISCOVERY_HOST_ENV_VAR)
+            .unwrap_or_else(|_| IpAddr::from(super::network_constants::LOCAL_HOST).to_string());
+        let discovery_port = std::env::var(DISCOVERY_PORT_ENV_VAR)
             .ok()
             .and_then(|p| p.parse().ok())
             .unwrap_or(super::network_constants::BASE_PORT);
-        let discovery_addr =
-            SocketAddr::from((super::network_constants::LOCAL_HOST, discovery_port));
-
-        Self::new(discovery_addr)
+        Self {
+            discovery_base_url: format!("http://{discovery_host}:{discovery_port}"),
+            client: Client::new(),
+        }
     }
 
     pub fn new(discovery_addr: SocketAddr) -> Self {
         Self {
-            discovery_addr,
+            discovery_base_url: format!("http://{discovery_addr}"),
             client: Client::new(),
         }
     }
@@ -45,12 +46,12 @@ impl HttpDiscoveryClient {
         let method = message.method();
         trace!(
             "Sending discovery message to {}{}",
-            self.discovery_addr, path
+            self.discovery_base_url, path
         );
 
         let mut builder = self
             .client
-            .request(method, format!("http://{}{}", self.discovery_addr, path))
+            .request(method, format!("{}{path}", self.discovery_base_url))
             .timeout(REQUEST_TIMEOUT);
         if message.method() != Method::GET {
             builder = builder

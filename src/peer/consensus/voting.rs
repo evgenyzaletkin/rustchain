@@ -84,12 +84,7 @@ pub fn handle_voting_input(
         ConsensusInput::LocalBlockProposed {
             block_hash,
             known_peers,
-        } => {
-            let mut consensus = VotingConsensus::new(peer_id, &known_peers);
-            consensus.make_vote(peer_id, true);
-            votings.insert(block_hash, consensus);
-            Vec::new()
-        }
+        } => handle_voting_vote(peer_id, votings, &known_peers, block_hash, peer_id, true),
         ConsensusInput::BlockProposalValidated {
             block_hash,
             proposer,

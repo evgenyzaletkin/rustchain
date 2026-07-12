@@ -2,6 +2,11 @@ use std::time::Duration;
 
 pub const PEER_ID_ENV_VAR: &str = "PEER_ID";
 pub const CONSENSUS_MODE_ENV_VAR: &str = "CONSENSUS_MODE";
+pub const PEER_BIND_HOST_ENV_VAR: &str = "PEER_BIND_HOST";
+pub const PEER_ADVERTISE_HOST_ENV_VAR: &str = "PEER_ADVERTISE_HOST";
+pub const DISCOVERY_HOST_ENV_VAR: &str = "DISCOVERY_HOST";
+pub const DISCOVERY_BIND_HOST_ENV_VAR: &str = "DISCOVERY_BIND_HOST";
+pub const DISCOVERY_PORT_ENV_VAR: &str = "DISCOVERY_PORT";
 
 pub const DEFAULT_CHANNEL_SIZE: usize = 1000;
 pub const DEFAULT_PATH_TO_BLOCKS: &str = "data";

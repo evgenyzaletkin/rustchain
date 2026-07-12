@@ -22,6 +22,27 @@ pub struct RaftLogEntry {
     pub block_hash: BlockHash,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RaftRoleState {
+    Follower,
+    Candidate,
+    Leader,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "mode", rename_all = "lowercase")]
+pub enum ConsensusState {
+    Voting,
+    Raft {
+        role: RaftRoleState,
+        term: u64,
+        leader_id: Option<PeerId>,
+        commit_index: u64,
+        last_log_index: u64,
+    },
+}
+
 pub enum ConsensusEngine {
     Voting {
         peer_id: PeerId,
@@ -134,6 +155,13 @@ impl ConsensusEngine {
         matches!(self, Self::Raft(_))
     }
 
+    pub fn state(&self) -> ConsensusState {
+        match self {
+            Self::Voting { .. } => ConsensusState::Voting,
+            Self::Raft(raft) => raft.state(),
+        }
+    }
+
     pub fn handle_input(&mut self, input: ConsensusInput) -> Vec<ConsensusAction> {
         match self {
             Self::Voting { peer_id, votings } => {
@@ -146,7 +174,7 @@ impl ConsensusEngine {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConsensusAction, ConsensusEngine, ConsensusInput, RaftLogEntry};
+    use super::{ConsensusAction, ConsensusEngine, ConsensusInput, ConsensusState, RaftLogEntry};
     use crate::crypto::KeyManager;
     use crate::peer::consensus::raft::{
         DEFAULT_ELECTION_TIMEOUT, DEFAULT_ELECTION_TIMEOUT_JITTER, DEFAULT_HEARTBEAT_INTERVAL,
@@ -183,6 +211,17 @@ mod tests {
         };
 
         SignedTransaction::new(transaction, signing_key)
+    }
+
+    #[test]
+    fn voting_consensus_reports_voting_state() {
+        let consensus = ConsensusEngine::new_voting(PeerId::from(1));
+
+        assert_eq!(consensus.state(), ConsensusState::Voting);
+        assert_eq!(
+            serde_json::to_value(consensus.state()).unwrap()["mode"],
+            "voting"
+        );
     }
 
     #[test]
@@ -238,6 +277,25 @@ mod tests {
         });
 
         assert!(actions.is_empty());
+    }
+
+    #[test]
+    fn local_block_proposal_emits_commit_when_self_vote_reaches_threshold() {
+        let mut consensus = ConsensusEngine::new_voting(PeerId::from(1));
+        let block_hash = hash(8);
+
+        let actions = consensus.handle_input(ConsensusInput::LocalBlockProposed {
+            block_hash,
+            known_peers: vec![PeerId::from(2), PeerId::from(3)],
+        });
+
+        assert_eq!(actions.len(), 2);
+        assert!(matches!(actions[0], ConsensusAction::CommitBlock(hash) if hash == block_hash));
+        assert!(matches!(
+            actions[1],
+            ConsensusAction::Broadcast(MessageBody::BlockApproved { block_hash: hash })
+                if hash == block_hash
+        ));
     }
 
     #[test]

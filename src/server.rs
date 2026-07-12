@@ -1,6 +1,6 @@
 use crate::crypto::KeyManager;
 use crate::network::{NetworkInterface, network_constants};
-use crate::peer::{Message, MessageBody};
+use crate::peer::{Message, MessageBody, PeerState, PeerStateView};
 use crate::storage::{BlockFile, BlockStorageState, BlockStorageView};
 use crate::transactions::{SignedTransaction, Transaction};
 use axum::extract::{Path, State};
@@ -17,6 +17,7 @@ use tokio::sync::RwLock;
 struct ServerState<N: NetworkInterface> {
     network: Arc<N>,
     latest_storage_view: BlockStorageView,
+    peer_state_view: PeerStateView,
 }
 
 type SharedState<N> = Arc<RwLock<ServerState<N>>>;
@@ -24,11 +25,13 @@ type SharedState<N> = Arc<RwLock<ServerState<N>>>;
 pub async fn run_server<N: NetworkInterface>(
     network: Arc<N>,
     block_storage_view: BlockStorageView,
+    peer_state_view: PeerStateView,
     addr: SocketAddr,
 ) {
     let server_state = Arc::new(RwLock::new(ServerState {
         network,
         latest_storage_view: block_storage_view,
+        peer_state_view,
     }));
     let app: Router<()> = Router::new()
         .route(
@@ -47,6 +50,7 @@ pub async fn run_server<N: NetworkInterface>(
             network_constants::LATEST_BLOCK_STATE_PATH,
             get(get_latest_storage_state),
         )
+        .route(network_constants::PEER_STATE_PATH, get(get_peer_state))
         .route("/block/state/{block_index}", get(get_block_state))
         .route("/block/{block_index}", get(get_block))
         .with_state(server_state);
@@ -131,6 +135,13 @@ async fn get_latest_storage_state<N: NetworkInterface>(
     let latest_state = state.read().await.latest_storage_view.get_latest_state();
     info!("received storage state request, responding with: {latest_state:?}");
     Json(latest_state)
+}
+
+async fn get_peer_state<N: NetworkInterface>(
+    State(state): State<SharedState<N>>,
+) -> Json<PeerState> {
+    let state = state.read().await;
+    Json(state.peer_state_view.get_state(state.network.known_peers()))
 }
 
 async fn get_block<N: NetworkInterface>(

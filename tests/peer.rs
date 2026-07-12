@@ -1,7 +1,8 @@
 #[cfg(test)]
 mod tests {
     use k256::ecdsa::SigningKey;
-    use rustchain::consensus::{ConsensusEngine, ConsensusInput};
+    use rustchain::consensus::raft::{DEFAULT_ELECTION_TIMEOUT, DEFAULT_ELECTION_TIMEOUT_JITTER};
+    use rustchain::consensus::{ConsensusEngine, ConsensusInput, ConsensusState, RaftRoleState};
     use rustchain::crypto::KeyManager;
     use rustchain::network::NetworkInterface;
     use rustchain::network::local_network::LocalNetwork;
@@ -19,6 +20,55 @@ mod tests {
 
     const TEST_DATA_PATH: &str = "target/test/data";
     static TEST_DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn test_peer_state_view_tracks_raft_state() {
+        let network = Arc::new(LocalNetwork::default());
+        let mut peer = create_raft_peer(PeerId::from(1), network.clone(), 5);
+        let state_view = peer.create_state_view();
+
+        let initial_state = state_view.get_state(vec![PeerId::from(3), PeerId::from(2)]);
+        assert_eq!(initial_state.peer_id, PeerId::from(1));
+        assert_eq!(
+            initial_state.known_peers,
+            vec![PeerId::from(3), PeerId::from(2)]
+        );
+        assert_eq!(initial_state.block.block_height, 0);
+        assert_eq!(
+            initial_state.consensus,
+            ConsensusState::Raft {
+                role: RaftRoleState::Follower,
+                term: 0,
+                leader_id: None,
+                commit_index: 0,
+                last_log_index: 0,
+            }
+        );
+
+        tick_consensus(
+            &mut peer,
+            &network,
+            Instant::now()
+                + DEFAULT_ELECTION_TIMEOUT
+                + DEFAULT_ELECTION_TIMEOUT_JITTER
+                + Duration::from_millis(1),
+        );
+
+        let leader_state = state_view.get_state(Vec::new());
+        assert_eq!(
+            leader_state.consensus,
+            ConsensusState::Raft {
+                role: RaftRoleState::Leader,
+                term: 1,
+                leader_id: Some(PeerId::from(1)),
+                commit_index: 0,
+                last_log_index: 0,
+            }
+        );
+        let serialized = serde_json::to_value(leader_state).unwrap();
+        assert_eq!(serialized["consensus"]["mode"], "raft");
+        assert_eq!(serialized["consensus"]["role"], "leader");
+    }
 
     #[tokio::test]
     async fn test_client_transaction_mempool_size_2() {
@@ -66,7 +116,7 @@ mod tests {
         peer.handle_message(client_msg);
 
         let broadcasted_messages = network.get_broadcasted_messages();
-        assert_eq!(broadcasted_messages.len(), 2);
+        assert_eq!(broadcasted_messages.len(), 3);
         assert!(broadcasted_messages.iter().any(|msg_body| {
             matches!(msg_body, MessageBody::Synchronization(verified_transaction) if verified_transaction.client_tx == transaction)
         }));
@@ -74,6 +124,11 @@ mod tests {
             broadcasted_messages
                 .iter()
                 .any(|msg_body| { matches!(msg_body, MessageBody::BlockProposal { .. }) })
+        );
+        assert!(
+            broadcasted_messages
+                .iter()
+                .any(|msg_body| { matches!(msg_body, MessageBody::BlockApproved { .. }) })
         );
     }
 

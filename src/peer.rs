@@ -5,15 +5,20 @@ mod messages;
 pub use crate::config::DEFAULT_CHANNEL_SIZE;
 use crate::network::NetworkInterface;
 use crate::peer::action_executor::{ActionResult, ConsensusActionExecutor};
-use crate::peer::consensus::{ConsensusAction, ConsensusEngine, ConsensusInput, RaftLogEntry};
+use crate::peer::consensus::{
+    ConsensusAction, ConsensusEngine, ConsensusInput, ConsensusState, RaftLogEntry,
+};
 pub use crate::peer::messages::{Message, MessageBody, PeerId, RaftReplicatedBlock, TxPayload};
 use crate::storage;
-use crate::storage::{BlockFile, BlockHash, BlockKeeper, BlockStatus};
+use crate::storage::{
+    BlockFile, BlockHash, BlockKeeper, BlockStatus, BlockStorageState, BlockStorageView,
+};
 use crate::transactions::{SignedTransaction, TransactionProcessor, VerifiedTransaction};
 use k256::ecdsa::{Signature, SigningKey, VerifyingKey};
 use log::debug;
+use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 pub struct Peer<Network: NetworkInterface> {
@@ -21,11 +26,37 @@ pub struct Peer<Network: NetworkInterface> {
     transaction_processor: TransactionProcessor,
     block_keeper: BlockKeeper,
     consensus: ConsensusEngine,
+    consensus_state: Arc<RwLock<ConsensusState>>,
     pending_raft_blocks: HashMap<BlockHash, BlockFile>,
     signing_key: SigningKey,
     public_key: VerifyingKey,
     network: Arc<Network>,
     last_completed_block: BlockHash,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct PeerState {
+    pub peer_id: PeerId,
+    pub known_peers: Vec<PeerId>,
+    pub block: BlockStorageState,
+    pub consensus: ConsensusState,
+}
+
+pub struct PeerStateView {
+    peer_id: PeerId,
+    block_storage_view: BlockStorageView,
+    consensus_state: Arc<RwLock<ConsensusState>>,
+}
+
+impl PeerStateView {
+    pub fn get_state(&self, known_peers: Vec<PeerId>) -> PeerState {
+        PeerState {
+            peer_id: self.peer_id,
+            known_peers,
+            block: self.block_storage_view.get_latest_state(),
+            consensus: self.consensus_state.read().unwrap().clone(),
+        }
+    }
 }
 
 impl<Network: NetworkInterface> Peer<Network> {
@@ -37,6 +68,7 @@ impl<Network: NetworkInterface> Peer<Network> {
         signing_key: SigningKey,
     ) -> Peer<Network> {
         let public_key = VerifyingKey::from(signing_key.clone());
+        let consensus_state = Arc::new(RwLock::new(consensus.state()));
         Self {
             id,
             transaction_processor: TransactionProcessor::default(),
@@ -44,6 +76,7 @@ impl<Network: NetworkInterface> Peer<Network> {
             public_key,
             block_keeper,
             consensus,
+            consensus_state,
             pending_raft_blocks: HashMap::new(),
             network: network.clone(),
             last_completed_block: storage::EMPTY_HASH,
@@ -52,6 +85,14 @@ impl<Network: NetworkInterface> Peer<Network> {
 
     pub fn block_keeper_mut(&mut self) -> &mut BlockKeeper {
         &mut self.block_keeper
+    }
+
+    pub fn create_state_view(&self) -> PeerStateView {
+        PeerStateView {
+            peer_id: self.id,
+            block_storage_view: self.block_keeper.create_block_storage_view(),
+            consensus_state: self.consensus_state.clone(),
+        }
     }
 
     pub fn handle_message(&mut self, message: Message) {
@@ -292,6 +333,11 @@ impl<Network: NetworkInterface> Peer<Network> {
         let mut pending_inputs = VecDeque::from([input]);
         while let Some(input) = pending_inputs.pop_front() {
             let actions = self.consensus.handle_input(input);
+            *self
+                .consensus_state
+                .write()
+                .map_err(|e| format!("Failed to update consensus state: {e}"))? =
+                self.consensus.state();
             let action_results = self.execute_consensus_actions(actions)?;
             pending_inputs.extend(
                 action_results

@@ -7,7 +7,19 @@ use serde::{Deserialize, Serialize};
 use std::str::FromStr;
 
 #[derive(
-    Clone, Eq, PartialEq, Hash, Copy, Debug, Display, From, Constructor, Serialize, Deserialize,
+    Clone,
+    Eq,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    Hash,
+    Copy,
+    Debug,
+    Display,
+    From,
+    Constructor,
+    Serialize,
+    Deserialize,
 )]
 pub struct PeerId(u32);
 
