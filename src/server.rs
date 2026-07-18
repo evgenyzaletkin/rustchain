@@ -1,10 +1,10 @@
 use crate::crypto::KeyManager;
-use crate::network::{network_constants, NetworkInterface};
-use crate::peer::{Message, MessageBody};
+use crate::network::{NetworkInterface, network_constants};
+use crate::peer::{Message, MessageBody, PeerState, PeerStateView};
 use crate::storage::{BlockFile, BlockStorageState, BlockStorageView};
 use crate::transactions::{SignedTransaction, Transaction};
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap};
+use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use log::info;
@@ -17,6 +17,7 @@ use tokio::sync::RwLock;
 struct ServerState<N: NetworkInterface> {
     network: Arc<N>,
     latest_storage_view: BlockStorageView,
+    peer_state_view: PeerStateView,
 }
 
 type SharedState<N> = Arc<RwLock<ServerState<N>>>;
@@ -24,17 +25,32 @@ type SharedState<N> = Arc<RwLock<ServerState<N>>>;
 pub async fn run_server<N: NetworkInterface>(
     network: Arc<N>,
     block_storage_view: BlockStorageView,
+    peer_state_view: PeerStateView,
     addr: SocketAddr,
 ) {
     let server_state = Arc::new(RwLock::new(ServerState {
         network,
         latest_storage_view: block_storage_view,
+        peer_state_view,
     }));
     let app: Router<()> = Router::new()
-        .route(network_constants::TRANSACTIONS_PATH, post(handle_client_transaction))
-        .route(network_constants::TEST_TRANSACTIONS_PATH, post(handle_test_transaction))
-        .route(network_constants::HANDLE_PEER_MESSAGE_PATH, post(hande_peer_message))
-        .route(network_constants::LATEST_BLOCK_STATE_PATH, get(get_latest_storage_state))
+        .route(
+            network_constants::TRANSACTIONS_PATH,
+            post(handle_client_transaction),
+        )
+        .route(
+            network_constants::TEST_TRANSACTIONS_PATH,
+            post(handle_test_transaction),
+        )
+        .route(
+            network_constants::HANDLE_PEER_MESSAGE_PATH,
+            post(hande_peer_message),
+        )
+        .route(
+            network_constants::LATEST_BLOCK_STATE_PATH,
+            get(get_latest_storage_state),
+        )
+        .route(network_constants::PEER_STATE_PATH, get(get_peer_state))
         .route("/block/state/{block_index}", get(get_block_state))
         .route("/block/{block_index}", get(get_block))
         .with_state(server_state);
@@ -99,10 +115,18 @@ async fn hande_peer_message<N: NetworkInterface>(
 async fn get_block_state<N: NetworkInterface>(
     State(state): State<SharedState<N>>,
     Path(block_index): Path<u32>,
-) -> Json<BlockStorageState> {
-    let block = state.read().await.latest_storage_view.get_block(block_index);
-    info!("received storage state request, responding with: {}", block.hash);
-    Json(BlockStorageState::from(&block))
+) -> Result<Json<BlockStorageState>, (StatusCode, String)> {
+    let block = state
+        .read()
+        .await
+        .latest_storage_view
+        .get_block(block_index)
+        .map_err(block_read_response)?;
+    info!(
+        "received storage state request, responding with: {}",
+        block.hash
+    );
+    Ok(Json(BlockStorageState::from(&block)))
 }
 
 async fn get_latest_storage_state<N: NetworkInterface>(
@@ -113,15 +137,30 @@ async fn get_latest_storage_state<N: NetworkInterface>(
     Json(latest_state)
 }
 
+async fn get_peer_state<N: NetworkInterface>(
+    State(state): State<SharedState<N>>,
+) -> Json<PeerState> {
+    let state = state.read().await;
+    Json(state.peer_state_view.get_state(state.network.known_peers()))
+}
+
 async fn get_block<N: NetworkInterface>(
     State(state): State<SharedState<N>>,
     Path(block_index): Path<u32>,
-) -> Json<BlockFile> {
-    Json(
-        state
-            .read()
-            .await
-            .latest_storage_view
-            .get_block(block_index),
-    )
+) -> Result<Json<BlockFile>, (StatusCode, String)> {
+    let block = state
+        .read()
+        .await
+        .latest_storage_view
+        .get_block(block_index)
+        .map_err(block_read_response)?;
+    Ok(Json(block))
+}
+
+fn block_read_response(error: String) -> (StatusCode, String) {
+    if error.starts_with("Block file not found") {
+        (StatusCode::NOT_FOUND, error)
+    } else {
+        (StatusCode::INTERNAL_SERVER_ERROR, error)
+    }
 }

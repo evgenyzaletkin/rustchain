@@ -1,8 +1,11 @@
+pub mod config;
 pub mod crypto;
+pub mod logging;
 pub mod network;
 pub mod peer;
-pub mod storage;
-pub mod transactions;
+pub use peer::consensus;
+pub mod peer_runtime;
 pub mod server;
-pub mod logging;
-mod synchronization;
+pub mod storage;
+pub mod synchronization;
+pub mod transactions;
