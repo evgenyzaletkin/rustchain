@@ -8,12 +8,14 @@ The codebase is intentionally split by responsibility. Preserve those boundaries
 
 ## Main Modules
 
-- `src/peer.rs`: peer message handling and side effects. `Peer` validates incoming messages, applies transactions, caches validated Raft block payloads, commits or rolls back blocks, and delegates consensus decisions to `ConsensusEngine`.
-- `src/peer/action_executor.rs`: executes `ConsensusAction`s returned by consensus. It owns side effects such as staging transactions/blocks, sending network messages, committing blocks, and rolling back blocks.
+- `src/peer.rs`: peer message routing and orchestration. `Peer` validates incoming payloads, delegates decisions to `ConsensusEngine`, executes effects through `PeerEffects`, and publishes consensus state snapshots through a Tokio watch channel.
+- `src/peer/effects.rs`: owns peer-side services and executes `ConsensusEffect`s. It owns transaction processing, block storage, signing, network delivery, commits, and rollbacks.
 - `src/peer/messages.rs`: peer message types and message payload structures.
-- `src/peer/consensus.rs`: consensus abstraction. `ConsensusEngine` accepts `ConsensusInput` and returns `ConsensusAction`.
+- `src/peer/consensus.rs`: consensus abstraction. `ConsensusEngine` exposes typed event handlers that return `ConsensusEffect`s.
 - `src/peer/consensus/voting.rs`: current voting-based block approval logic.
-- `src/peer/consensus/raft.rs`: Raft-mode leader election, heartbeats, leader tracking, client forwarding, log replication, and commit advancement.
+- `src/peer/consensus/raft.rs`: Raft state, typed event dispatch, and accepted pending block payloads.
+- `src/peer/consensus/raft/election.rs`: Raft membership, elections, votes, and leader tracking.
+- `src/peer/consensus/raft/replication.rs`: Raft heartbeats, log replication, persistence, and commit advancement.
 - `src/peer/consensus/raft_log_store.rs`: Raft log storage abstraction with file-backed runtime storage and in-memory test storage.
 - `src/peer_runtime.rs`: runtime wiring and orchestration. It builds the network, block keeper, synchronization service, consensus engine, signing key, server task, and async event loop.
 - `src/network/`: peer transport abstractions and implementations.
@@ -28,9 +30,9 @@ The codebase is intentionally split by responsibility. Preserve those boundaries
 
 Consensus is isolated from peer side effects:
 
-- Consensus receives events through `ConsensusInput`.
-- Consensus returns requested effects through `ConsensusAction`.
-- `Peer` and `ConsensusActionExecutor` are responsible for executing effects such as broadcasting messages, sending direct peer messages, staging accepted Raft blocks, committing blocks, rolling back blocks, and applying client transactions.
+- Consensus receives validated events through typed `ConsensusEngine::on_*` methods.
+- Consensus returns requested effects through `ConsensusEffect`.
+- `PeerEffects` executes effects such as broadcasting messages, sending direct peer messages, staging accepted Raft blocks, committing blocks, rolling back blocks, and applying client transactions.
 
 Supported modes:
 
@@ -44,7 +46,8 @@ Raft-specific boundaries:
 - Consensus must not perform network side effects.
 - Raft consensus owns Raft log persistence through `RaftLogStorage`.
 - `Peer` must not own or instantiate Raft log storage.
-- `Peer` may validate received Raft block payloads before consensus, but must not stage them in `BlockKeeper` until consensus accepts the corresponding `RaftLogEntry`s and returns `ConsensusAction::StageRaftEntries`.
+- `Peer` validates received Raft block payloads and passes them to consensus without retaining them.
+- Raft consensus owns accepted pending block payloads until `ConsensusEffect::StageRaftEntries` is executed; only then may the executor stage them in `BlockKeeper`.
 - `BlockFile::verify_block_vec` / `BlockFile::verify_block` validate signature, hash, and internal block content only.
 - `BlockKeeper::block_can_be_added` owns the current-chain or staged-chain previous-hash check.
 
@@ -64,9 +67,9 @@ Shared defaults live in `src/config.rs`.
 - Preserve behavior when refactoring unless the user explicitly asks for behavior changes.
 - Keep changes small and testable.
 - Prefer existing module boundaries over adding cross-module shortcuts.
-- Keep consensus logic out of `Peer`; use `ConsensusInput` and `ConsensusAction`.
+- Keep consensus logic out of `Peer`; use typed `ConsensusEngine` handlers and `ConsensusEffect`.
 - Keep network/discovery concerns out of consensus.
-- Keep block storage side effects in `Peer` / `ConsensusActionExecutor`. Raft log persistence is the exception and belongs to Raft consensus through `RaftLogStorage`.
+- Keep transaction, block storage, signing, and network side effects in `PeerEffects`. Raft log persistence is the exception and belongs to Raft consensus through `RaftLogStorage`.
 - Do not stage Raft-replicated blocks before consensus validates and accepts the Raft log entries.
 - Prefer focused unit tests around consensus behavior and peer message handling when changing those areas.
 - Run `cargo test` after behavior changes.
@@ -76,6 +79,6 @@ Shared defaults live in `src/config.rs`.
 
 ```text
 cargo test
-rustfmt --edition 2024 --check src/lib.rs src/config.rs src/peer.rs src/peer/action_executor.rs src/peer/messages.rs src/peer/consensus.rs src/peer/consensus/raft.rs src/peer/consensus/raft_log_store.rs src/peer/consensus/voting.rs src/peer_runtime.rs tests/peer.rs
+rustfmt --edition 2024 --check src/lib.rs src/config.rs src/peer.rs src/peer/effects.rs src/peer/messages.rs src/peer/consensus.rs src/peer/consensus/raft.rs src/peer/consensus/raft/election.rs src/peer/consensus/raft/replication.rs src/peer/consensus/raft_log_store.rs src/peer/consensus/voting.rs src/peer_runtime.rs tests/peer.rs
 PEER_ID=1 CONSENSUS_MODE=raft cargo run --bin peer_runner
 ```

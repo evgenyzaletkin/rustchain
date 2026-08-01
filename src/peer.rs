@@ -1,37 +1,28 @@
-mod action_executor;
 pub mod consensus;
+mod effects;
 mod messages;
 
 pub use crate::config::DEFAULT_CHANNEL_SIZE;
 use crate::network::NetworkInterface;
-use crate::peer::action_executor::{ActionResult, ConsensusActionExecutor};
 use crate::peer::consensus::{
-    ConsensusAction, ConsensusEngine, ConsensusInput, ConsensusState, RaftLogEntry,
+    ConsensusEffect, ConsensusEngine, ConsensusState, ValidatedRaftBlock,
 };
+use crate::peer::effects::PeerEffects;
 pub use crate::peer::messages::{Message, MessageBody, PeerId, RaftReplicatedBlock, TxPayload};
-use crate::storage;
-use crate::storage::{
-    BlockFile, BlockHash, BlockKeeper, BlockStatus, BlockStorageState, BlockStorageView,
-};
-use crate::transactions::{SignedTransaction, TransactionProcessor, VerifiedTransaction};
+use crate::storage::{BlockFile, BlockHash, BlockKeeper, BlockStorageState, BlockStorageView};
+use crate::transactions::{SignedTransaction, VerifiedTransaction};
 use k256::ecdsa::{Signature, SigningKey, VerifyingKey};
 use log::debug;
 use serde::Serialize;
-use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Instant;
+use tokio::sync::watch;
 
 pub struct Peer<Network: NetworkInterface> {
     pub id: PeerId,
-    transaction_processor: TransactionProcessor,
-    block_keeper: BlockKeeper,
     consensus: ConsensusEngine,
-    consensus_state: Arc<RwLock<ConsensusState>>,
-    pending_raft_blocks: HashMap<BlockHash, BlockFile>,
-    signing_key: SigningKey,
-    public_key: VerifyingKey,
-    network: Arc<Network>,
-    last_completed_block: BlockHash,
+    consensus_state_tx: watch::Sender<ConsensusState>,
+    effects: PeerEffects<Network>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -45,7 +36,7 @@ pub struct PeerState {
 pub struct PeerStateView {
     peer_id: PeerId,
     block_storage_view: BlockStorageView,
-    consensus_state: Arc<RwLock<ConsensusState>>,
+    consensus_state_rx: watch::Receiver<ConsensusState>,
 }
 
 impl PeerStateView {
@@ -54,7 +45,7 @@ impl PeerStateView {
             peer_id: self.peer_id,
             known_peers,
             block: self.block_storage_view.get_latest_state(),
-            consensus: self.consensus_state.read().unwrap().clone(),
+            consensus: self.consensus_state_rx.borrow().clone(),
         }
     }
 }
@@ -67,31 +58,24 @@ impl<Network: NetworkInterface> Peer<Network> {
         block_keeper: BlockKeeper,
         signing_key: SigningKey,
     ) -> Peer<Network> {
-        let public_key = VerifyingKey::from(signing_key.clone());
-        let consensus_state = Arc::new(RwLock::new(consensus.state()));
+        let (consensus_state_tx, _) = watch::channel(consensus.state());
         Self {
             id,
-            transaction_processor: TransactionProcessor::default(),
-            signing_key,
-            public_key,
-            block_keeper,
             consensus,
-            consensus_state,
-            pending_raft_blocks: HashMap::new(),
-            network: network.clone(),
-            last_completed_block: storage::EMPTY_HASH,
+            consensus_state_tx,
+            effects: PeerEffects::new(id, network, block_keeper, signing_key),
         }
     }
 
     pub fn block_keeper_mut(&mut self) -> &mut BlockKeeper {
-        &mut self.block_keeper
+        self.effects.block_keeper_mut()
     }
 
     pub fn create_state_view(&self) -> PeerStateView {
         PeerStateView {
             peer_id: self.id,
-            block_storage_view: self.block_keeper.create_block_storage_view(),
-            consensus_state: self.consensus_state.clone(),
+            block_storage_view: self.effects.create_block_storage_view(),
+            consensus_state_rx: self.consensus_state_tx.subscribe(),
         }
     }
 
@@ -154,8 +138,8 @@ impl<Network: NetworkInterface> Peer<Network> {
 
     fn process_client_transaction(&mut self, client_tx: SignedTransaction) -> Result<(), String> {
         client_tx.verify()?;
-
-        self.handle_consensus_input(ConsensusInput::ClientTransactionReceived(client_tx))
+        let effects = self.consensus.on_client_transaction(client_tx)?;
+        self.execute_consensus_effects(effects)
     }
 
     fn synchronize_transaction(&mut self, verified_tx: VerifiedTransaction) -> Result<(), String> {
@@ -163,19 +147,11 @@ impl<Network: NetworkInterface> Peer<Network> {
         verified_tx.verify()?;
 
         let client_tx = verified_tx.client_tx;
-        self.transaction_processor
-            .process_transaction(client_tx.clone())
-            .map_err(|e| e.to_string())?;
-        if let BlockStatus::NewBlockCreated { block_hash } =
-            self.block_keeper.add_transaction(client_tx.clone())
-        {
-            self.handle_new_block_created(block_hash)?
+        if let Some(block_hash) = self.effects.stage_client_transaction(client_tx)? {
+            let effects = self.consensus.on_block_created(block_hash)?;
+            self.execute_consensus_effects(effects)?;
         }
         Ok(())
-    }
-
-    fn handle_new_block_created(&mut self, block_hash: BlockHash) -> Result<(), String> {
-        self.handle_consensus_input(ConsensusInput::NewBlockCreated { block_hash })
     }
 
     fn process_block_proposal(
@@ -186,7 +162,7 @@ impl<Network: NetworkInterface> Peer<Network> {
         public_key: VerifyingKey,
         from: PeerId,
     ) -> Result<(), String> {
-        if self.last_completed_block == block_hash {
+        if self.effects.last_completed_block() == block_hash {
             return Ok(());
         }
 
@@ -195,20 +171,17 @@ impl<Network: NetworkInterface> Peer<Network> {
         let mut is_ok = false;
         if let Ok(block_file) = verification_result {
             is_ok = true;
-            if self.block_keeper.block_can_be_added(&block_file) {
-                self.block_keeper
-                    .add_external_block(block_file)
-                    .map_err(|e| e.to_string())?;
-            }
+            self.effects.stage_external_block(block_file)?;
             // Probably, we should call synchronization here in else block if the height
             // is less than block_index - 1
         }
-        self.handle_consensus_input(ConsensusInput::BlockProposalValidated {
+        let effects = self.consensus.on_block_proposal_validated(
             block_hash,
-            proposer: from,
-            valid: is_ok,
-            known_peers: self.network.known_peers(),
-        })
+            from,
+            is_ok,
+            self.effects.known_peers(),
+        )?;
+        self.execute_consensus_effects(effects)
     }
 
     fn process_block_vote(
@@ -217,16 +190,15 @@ impl<Network: NetworkInterface> Peer<Network> {
         from: PeerId,
         approve: bool,
     ) -> Result<(), String> {
-        if self.last_completed_block != block_hash {
-            self.block_keeper
-                .get_uncommited_block(&block_hash)
-                .ok_or_else(|| format!("Block ${block_hash} is not found"))?;
-            self.handle_consensus_input(ConsensusInput::BlockVoteReceived {
+        if self.effects.last_completed_block() != block_hash {
+            self.effects.ensure_uncommitted_block(&block_hash)?;
+            let effects = self.consensus.on_block_vote(
                 block_hash,
                 from,
                 approve,
-                known_peers: self.network.known_peers(),
-            })?;
+                self.effects.known_peers(),
+            )?;
+            self.execute_consensus_effects(effects)?;
         }
         Ok(())
     }
@@ -237,12 +209,10 @@ impl<Network: NetworkInterface> Peer<Network> {
         from: PeerId,
         approve: bool,
     ) -> Result<(), String> {
-        self.handle_consensus_input(ConsensusInput::BlockVoteReceived {
-            block_hash,
-            from,
-            approve,
-            known_peers: self.network.known_peers(),
-        })
+        let effects =
+            self.consensus
+                .on_block_vote(block_hash, from, approve, self.effects.known_peers())?;
+        self.execute_consensus_effects(effects)
     }
 
     fn process_raft_request_vote(
@@ -251,11 +221,8 @@ impl<Network: NetworkInterface> Peer<Network> {
         candidate_id: PeerId,
         from: PeerId,
     ) -> Result<(), String> {
-        self.handle_consensus_input(ConsensusInput::RaftRequestVote {
-            term,
-            candidate_id,
-            from,
-        })
+        let effects = self.consensus.on_request_vote(term, candidate_id, from)?;
+        self.execute_consensus_effects(effects)
     }
 
     fn process_raft_request_vote_response(
@@ -264,11 +231,10 @@ impl<Network: NetworkInterface> Peer<Network> {
         voter_id: PeerId,
         vote_granted: bool,
     ) -> Result<(), String> {
-        self.handle_consensus_input(ConsensusInput::RaftRequestVoteResponse {
-            term,
-            voter_id,
-            vote_granted,
-        })
+        let effects = self
+            .consensus
+            .on_request_vote_response(term, voter_id, vote_granted)?;
+        self.execute_consensus_effects(effects)
     }
 
     fn process_raft_append_entries(
@@ -281,17 +247,18 @@ impl<Network: NetworkInterface> Peer<Network> {
         leader_commit: u64,
         from: PeerId,
     ) -> Result<(), String> {
-        let log_entries = self.stage_raft_entries(entries)?;
-        self.handle_consensus_input(ConsensusInput::RaftAppendEntries {
+        let validated_blocks = Self::validate_raft_blocks(entries)?;
+        let effects = self.consensus.on_append_entries(
             term,
             leader_id,
             prev_log_index,
             prev_log_term,
-            entries: log_entries,
+            validated_blocks,
             leader_commit,
             from,
-            now: Instant::now(),
-        })
+            Instant::now(),
+        )?;
+        self.execute_consensus_effects(effects)
     }
 
     fn process_raft_append_entries_response(
@@ -301,19 +268,16 @@ impl<Network: NetworkInterface> Peer<Network> {
         success: bool,
         match_index: u64,
     ) -> Result<(), String> {
-        self.handle_consensus_input(ConsensusInput::RaftAppendEntriesResponse {
-            term,
-            from,
-            success,
-            match_index,
-        })
+        let effects =
+            self.consensus
+                .on_append_entries_response(term, from, success, match_index)?;
+        self.execute_consensus_effects(effects)
     }
 
-    fn stage_raft_entries(
-        &mut self,
+    fn validate_raft_blocks(
         entries: Vec<RaftReplicatedBlock>,
-    ) -> Result<Vec<RaftLogEntry>, String> {
-        let mut log_entries = Vec::with_capacity(entries.len());
+    ) -> Result<Vec<ValidatedRaftBlock>, String> {
+        let mut validated_blocks = Vec::with_capacity(entries.len());
         for replicated_block in entries {
             let block_file = BlockFile::verify_block_vec(
                 replicated_block.entry.block_hash,
@@ -322,50 +286,22 @@ impl<Network: NetworkInterface> Peer<Network> {
                 replicated_block.public_key,
             )
             .map_err(|e| e.to_string())?;
-            self.pending_raft_blocks
-                .insert(replicated_block.entry.block_hash, block_file);
-            log_entries.push(replicated_block.entry);
+            validated_blocks.push(ValidatedRaftBlock {
+                entry: replicated_block.entry,
+                block_file,
+            });
         }
-        Ok(log_entries)
+        Ok(validated_blocks)
     }
 
-    pub fn handle_consensus_input(&mut self, input: ConsensusInput) -> Result<(), String> {
-        let mut pending_inputs = VecDeque::from([input]);
-        while let Some(input) = pending_inputs.pop_front() {
-            let actions = self.consensus.handle_input(input);
-            *self
-                .consensus_state
-                .write()
-                .map_err(|e| format!("Failed to update consensus state: {e}"))? =
-                self.consensus.state();
-            let action_results = self.execute_consensus_actions(actions)?;
-            pending_inputs.extend(
-                action_results
-                    .into_iter()
-                    .map(ActionResult::into_consensus_input),
-            );
-        }
+    pub fn handle_tick(&mut self, now: Instant) -> Result<(), String> {
+        let effects = self.consensus.on_tick(now, self.effects.known_peers())?;
+        self.execute_consensus_effects(effects)
+    }
+
+    fn execute_consensus_effects(&mut self, effects: Vec<ConsensusEffect>) -> Result<(), String> {
+        self.effects.execute_all(&mut self.consensus, effects)?;
+        self.consensus_state_tx.send_replace(self.consensus.state());
         Ok(())
-    }
-
-    fn execute_consensus_actions(
-        &mut self,
-        actions: Vec<ConsensusAction>,
-    ) -> Result<Vec<ActionResult>, String> {
-        let mut executor = ConsensusActionExecutor {
-            peer_id: self.id,
-            transaction_processor: &mut self.transaction_processor,
-            block_keeper: &mut self.block_keeper,
-            pending_raft_blocks: &mut self.pending_raft_blocks,
-            signing_key: &self.signing_key,
-            public_key: self.public_key,
-            network: &self.network,
-            last_completed_block: &mut self.last_completed_block,
-        };
-        let mut action_results = Vec::new();
-        for action in actions {
-            action_results.extend(executor.execute(action)?);
-        }
-        Ok(action_results)
     }
 }

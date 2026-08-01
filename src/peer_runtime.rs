@@ -1,4 +1,3 @@
-use std::env;
 use crate::config::{
     CONSENSUS_MODE_ENV_VAR, DEFAULT_BASE_PORT, DEFAULT_CHANNEL_SIZE,
     DEFAULT_CONSENSUS_TICK_INTERVAL, DEFAULT_LOCAL_HOST, DEFAULT_MEMPOOL_SIZE,
@@ -8,13 +7,14 @@ use crate::config::{
 use crate::crypto::KeyManager;
 use crate::network::NetworkInterface;
 use crate::network::rest_network::RestNetwork;
+use crate::peer::consensus::ConsensusEngine;
 use crate::peer::consensus::raft_log_store::FileRaftLogStore;
-use crate::peer::consensus::{ConsensusEngine, ConsensusInput};
 use crate::peer::{Peer, PeerId};
 use crate::server;
 use crate::storage::{BlockKeeper, BlockStorageView};
 use crate::synchronization::Synchronization;
 use log::info;
+use std::env;
 use std::future::pending;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
@@ -159,10 +159,7 @@ pub async fn run_peer(peer_config: PeerConfig) -> Result<(), String> {
                 }
             },
             _ = next_interval_tick(&mut consensus_interval) => {
-                peer.handle_consensus_input(ConsensusInput::Tick {
-                    now: Instant::now(),
-                    known_peers: network.known_peers(),
-                })?;
+                peer.handle_tick(Instant::now())?;
             }
         }
     }

@@ -2,9 +2,8 @@
 mod tests {
     use k256::ecdsa::SigningKey;
     use rustchain::consensus::raft::{DEFAULT_ELECTION_TIMEOUT, DEFAULT_ELECTION_TIMEOUT_JITTER};
-    use rustchain::consensus::{ConsensusEngine, ConsensusInput, ConsensusState, RaftRoleState};
+    use rustchain::consensus::{ConsensusEngine, ConsensusState, RaftRoleState};
     use rustchain::crypto::KeyManager;
-    use rustchain::network::NetworkInterface;
     use rustchain::network::local_network::LocalNetwork;
     use rustchain::peer::{Message, MessageBody, Peer, PeerId};
     use rustchain::storage::BlockKeeper;
@@ -518,12 +517,8 @@ mod tests {
         )
     }
 
-    fn tick_consensus(peer: &mut Peer<LocalNetwork>, network: &Arc<LocalNetwork>, now: Instant) {
-        peer.handle_consensus_input(ConsensusInput::Tick {
-            now,
-            known_peers: network.known_peers(),
-        })
-        .unwrap();
+    fn tick_consensus(peer: &mut Peer<LocalNetwork>, _network: &Arc<LocalNetwork>, now: Instant) {
+        peer.handle_tick(now).unwrap();
     }
 
     fn recreate_dir(path: &PathBuf) {

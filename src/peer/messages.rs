@@ -100,3 +100,42 @@ pub struct Message {
     pub to: PeerId,
     pub body: MessageBody,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{Message, MessageBody, PeerId};
+    use crate::storage::BlockHash;
+    use serde_json::json;
+
+    #[test]
+    fn raft_message_wire_shape_is_stable() {
+        let message = Message {
+            from: PeerId::from(1),
+            to: PeerId::from(2),
+            body: MessageBody::RaftRequestVote {
+                term: 7,
+                candidate_id: PeerId::from(1),
+            },
+        };
+
+        let value = serde_json::to_value(&message).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "from": 1,
+                "to": 2,
+                "body": {"RaftRequestVote": {"term": 7, "candidate_id": 1}}
+            })
+        );
+    }
+
+    #[test]
+    fn voting_message_wire_shape_is_stable() {
+        let body = MessageBody::BlockApproved {
+            block_hash: BlockHash::new([3; 32]),
+        };
+
+        let value = serde_json::to_value(&body).unwrap();
+        assert_eq!(value, json!({"BlockApproved": {"block_hash": vec![3; 32]}}));
+    }
+}

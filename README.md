@@ -218,8 +218,9 @@ Add `-v` to the corresponding `down` command to delete that demo's blocks, keys,
 ```bash
 cargo test
 rustfmt --edition 2024 --check \
-  src/lib.rs src/config.rs src/peer.rs src/peer/action_executor.rs \
+  src/lib.rs src/config.rs src/peer.rs src/peer/effects.rs \
   src/peer/messages.rs src/peer/consensus.rs src/peer/consensus/raft.rs \
+  src/peer/consensus/raft/election.rs src/peer/consensus/raft/replication.rs \
   src/peer/consensus/raft_log_store.rs src/peer/consensus/voting.rs \
   src/peer_runtime.rs tests/peer.rs
 ```
