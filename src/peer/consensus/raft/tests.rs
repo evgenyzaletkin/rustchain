@@ -2,8 +2,9 @@ use super::{
     DEFAULT_ELECTION_TIMEOUT, DEFAULT_ELECTION_TIMEOUT_JITTER, DEFAULT_HEARTBEAT_INTERVAL,
     RaftConsensus, RaftRole, VoteResponse,
 };
+use crate::peer::MessageBody;
 use crate::peer::PeerId;
-use crate::peer::consensus::RaftLogEntry;
+use crate::peer::consensus::{ConsensusEffect, RaftLogEntry};
 use crate::storage::BlockHash;
 use std::time::{Duration, Instant};
 
@@ -22,7 +23,7 @@ fn log_entry(index: u64, term: u64) -> RaftLogEntry {
     RaftLogEntry {
         term,
         index,
-        block_hash: hash(index as u8),
+        block_hash: hash(u8::try_from(index).expect("test index should fit in u8")),
     }
 }
 
@@ -37,6 +38,31 @@ fn starts_election_as_candidate_and_votes_for_self() {
     assert_eq!(consensus.role, RaftRole::Candidate);
     assert_eq!(consensus.voted_for, Some(PeerId::from(1)));
     assert_eq!(consensus.leader_id, None);
+}
+
+#[test]
+fn election_request_includes_candidates_last_log_metadata() {
+    let mut consensus = RaftConsensus::new(PeerId::from(1));
+    consensus.update_participants(&[PeerId::from(2), PeerId::from(3)]);
+    consensus.log = vec![log_entry(1, 1), log_entry(2, 3)];
+    let election_at = consensus.last_heartbeat_received_at
+        + DEFAULT_ELECTION_TIMEOUT
+        + DEFAULT_ELECTION_TIMEOUT_JITTER
+        + Duration::from_secs(1);
+
+    let effects = consensus
+        .on_tick(election_at, &[PeerId::from(2), PeerId::from(3)])
+        .unwrap();
+
+    assert!(matches!(
+        effects.as_slice(),
+        [ConsensusEffect::Broadcast(MessageBody::RaftRequestVote {
+            term: 1,
+            candidate_id,
+            last_log_index: 2,
+            last_log_term: 3,
+        })] if *candidate_id == PeerId::from(1)
+    ));
 }
 
 #[test]
@@ -57,11 +83,11 @@ fn grants_one_vote_per_term() {
     consensus.update_participants(&[PeerId::from(2), PeerId::from(3)]);
 
     assert_eq!(
-        consensus.request_vote(1, PeerId::from(2)),
+        consensus.request_vote(1, PeerId::from(2), 0, 0),
         VoteResponse::Granted
     );
     assert_eq!(
-        consensus.request_vote(1, PeerId::from(3)),
+        consensus.request_vote(1, PeerId::from(3), 0, 0),
         VoteResponse::Rejected
     );
     assert_eq!(consensus.voted_for, Some(PeerId::from(2)));
@@ -72,13 +98,64 @@ fn rejects_stale_term_vote_requests() {
     let mut consensus = RaftConsensus::new(PeerId::from(1));
     consensus.update_participants(&[PeerId::from(2), PeerId::from(3)]);
 
-    consensus.request_vote(2, PeerId::from(2));
+    consensus.request_vote(2, PeerId::from(2), 0, 0);
 
     assert_eq!(
-        consensus.request_vote(1, PeerId::from(3)),
+        consensus.request_vote(1, PeerId::from(3), 0, 0),
         VoteResponse::Rejected
     );
     assert_eq!(consensus.current_term, 2);
+}
+
+#[test]
+fn rejects_candidate_with_older_last_log_term() {
+    let mut consensus = RaftConsensus::new(PeerId::from(1));
+    consensus.log = vec![log_entry(1, 2)];
+
+    assert_eq!(
+        consensus.request_vote(3, PeerId::from(2), 10, 1),
+        VoteResponse::Rejected
+    );
+    assert_eq!(consensus.voted_for, None);
+}
+
+#[test]
+fn rejects_candidate_with_shorter_log_in_same_last_term() {
+    let mut consensus = RaftConsensus::new(PeerId::from(1));
+    consensus.log = vec![log_entry(1, 2), log_entry(2, 2)];
+
+    assert_eq!(
+        consensus.request_vote(3, PeerId::from(2), 1, 2),
+        VoteResponse::Rejected
+    );
+    assert_eq!(consensus.voted_for, None);
+}
+
+#[test]
+fn grants_vote_to_candidate_with_newer_last_log_term() {
+    let mut consensus = RaftConsensus::new(PeerId::from(1));
+    consensus.log = vec![log_entry(1, 1), log_entry(2, 1)];
+
+    assert_eq!(
+        consensus.request_vote(3, PeerId::from(2), 1, 2),
+        VoteResponse::Granted
+    );
+    assert_eq!(consensus.voted_for, Some(PeerId::from(2)));
+}
+
+#[test]
+fn stale_candidate_in_newer_term_steps_node_down_but_is_rejected() {
+    let mut consensus = RaftConsensus::new(PeerId::from(1));
+    consensus.log = vec![log_entry(1, 1)];
+    consensus.start_election_at(Instant::now());
+
+    assert_eq!(
+        consensus.request_vote(2, PeerId::from(2), 1, 0),
+        VoteResponse::Rejected
+    );
+    assert_eq!(consensus.current_term, 2);
+    assert_eq!(consensus.role, RaftRole::Follower);
+    assert_eq!(consensus.voted_for, None);
 }
 
 #[test]
@@ -129,6 +206,7 @@ fn append_entries_rejects_non_participant_leader() {
 fn append_entries_rejects_different_leader_before_timeout() {
     let now = Instant::now();
     let mut consensus = create_consensus(now);
+    assert!(consensus.receive_append_entries_at(1, PeerId::from(2), PeerId::from(2), now));
 
     assert!(!consensus.receive_append_entries_at(
         1,
@@ -137,6 +215,24 @@ fn append_entries_rejects_different_leader_before_timeout() {
         now + DEFAULT_ELECTION_TIMEOUT - Duration::from_secs(1)
     ));
     assert_eq!(consensus.leader_id, Some(PeerId::from(2)));
+}
+
+#[test]
+fn append_entries_accepts_different_leader_in_newer_term_before_timeout() {
+    let now = Instant::now();
+    let mut consensus = create_consensus(now);
+    assert!(consensus.receive_append_entries_at(1, PeerId::from(2), PeerId::from(2), now));
+
+    assert!(consensus.receive_append_entries_at(
+        2,
+        PeerId::from(3),
+        PeerId::from(3),
+        now + DEFAULT_ELECTION_TIMEOUT - Duration::from_secs(1)
+    ));
+
+    assert_eq!(consensus.current_term, 2);
+    assert_eq!(consensus.role, RaftRole::Follower);
+    assert_eq!(consensus.leader_id, Some(PeerId::from(3)));
 }
 
 #[test]
@@ -224,6 +320,44 @@ fn append_entries_rejects_non_contiguous_entries() {
             .is_none()
     );
     assert_eq!(consensus.last_log_index(), 0);
+}
+
+#[test]
+fn current_term_noop_replaces_conflicting_uncommitted_suffix() {
+    let now = Instant::now();
+    let mut consensus = create_consensus(now);
+    consensus.log = vec![log_entry(1, 1), log_entry(2, 1)];
+    consensus.commit_index = 1;
+
+    let effects = consensus
+        .append_entries(1, 1, vec![RaftLogEntry::noop(2, 2)], 1)
+        .unwrap();
+
+    assert_eq!(
+        consensus.log,
+        vec![log_entry(1, 1), RaftLogEntry::noop(2, 2)]
+    );
+    assert_eq!(effects.len(), 1);
+    assert!(matches!(
+        effects[0],
+        ConsensusEffect::RollbackBlock(rolled_back) if rolled_back == hash(2)
+    ));
+    assert_eq!(consensus.commit_index, 1);
+}
+
+#[test]
+fn append_entries_never_truncates_committed_entries() {
+    let now = Instant::now();
+    let mut consensus = create_consensus(now);
+    consensus.log = vec![log_entry(1, 1), log_entry(2, 1)];
+    consensus.commit_index = 2;
+
+    assert!(
+        consensus
+            .append_entries(1, 1, vec![RaftLogEntry::noop(2, 2)], 2)
+            .is_none()
+    );
+    assert_eq!(consensus.log, vec![log_entry(1, 1), log_entry(2, 1)]);
 }
 
 #[test]

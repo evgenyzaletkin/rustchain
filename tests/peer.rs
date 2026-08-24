@@ -1,12 +1,13 @@
 #[cfg(test)]
 mod tests {
-    use k256::ecdsa::SigningKey;
+    use k256::ecdsa::signature::Signer;
+    use k256::ecdsa::{Signature, SigningKey, VerifyingKey};
     use rustchain::consensus::raft::{DEFAULT_ELECTION_TIMEOUT, DEFAULT_ELECTION_TIMEOUT_JITTER};
     use rustchain::consensus::{ConsensusEngine, ConsensusState, RaftRoleState};
     use rustchain::crypto::KeyManager;
     use rustchain::network::local_network::LocalNetwork;
     use rustchain::peer::{Message, MessageBody, Peer, PeerId};
-    use rustchain::storage::BlockKeeper;
+    use rustchain::storage::{BlockFile, BlockHash, BlockKeeper};
     use rustchain::transactions::{
         AssetType, Metadata, Operation, SignedTransaction, Transaction, VerifiedTransaction,
     };
@@ -60,8 +61,8 @@ mod tests {
                 role: RaftRoleState::Leader,
                 term: 1,
                 leader_id: Some(PeerId::from(1)),
-                commit_index: 0,
-                last_log_index: 0,
+                commit_index: 1,
+                last_log_index: 1,
             }
         );
         let serialized = serde_json::to_value(leader_state).unwrap();
@@ -202,6 +203,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_block_proposal_that_cannot_be_staged_is_rejected_not_approved() {
+        let mut network = LocalNetwork::default();
+        network.add_known_peer(PeerId::from(2));
+        network.add_known_peer(PeerId::from(3));
+        network.add_known_peer(PeerId::from(4));
+        let network = Arc::new(network);
+        let mut peer = create_peer(PeerId::from(1), network.clone(), 1);
+
+        // A cryptographically valid proposal whose previous_hash does not extend this
+        // peer's (empty) local chain, so `block_can_be_added` must reject it even though
+        // signature and hash verification succeed.
+        let proposer_key = KeyManager::create_key();
+        let block_file = BlockFile::create(Vec::new(), BlockHash::new([9; 32]), 1);
+        let block_hash = block_file.hash;
+        let block_bytes = serde_json::to_vec(&block_file).unwrap();
+        let signature: Signature = proposer_key.sign(&block_bytes);
+
+        peer.handle_message(Message {
+            from: PeerId::from(2),
+            to: PeerId::from(1),
+            body: MessageBody::BlockProposal {
+                block_hash,
+                block_file: block_bytes,
+                signature,
+                public_key: VerifyingKey::from(&proposer_key),
+            },
+        });
+
+        let broadcasted_messages = network.get_broadcasted_messages();
+        assert!(broadcasted_messages.iter().any(|message| matches!(
+            message,
+            MessageBody::BlockReject { block_hash: rejected } if *rejected == block_hash
+        )));
+        assert!(
+            !broadcasted_messages
+                .iter()
+                .any(|message| matches!(message, MessageBody::BlockApproved { .. }))
+        );
+    }
+
+    #[tokio::test]
     async fn test_raft_election_request_is_broadcast() {
         let mut network = LocalNetwork::default();
         network.add_known_peer(PeerId::from(2));
@@ -222,6 +264,8 @@ mod tests {
             MessageBody::RaftRequestVote {
                 term: 1,
                 candidate_id,
+                last_log_index: 0,
+                last_log_term: 0,
             } if candidate_id == PeerId::from(1)
         ));
     }
@@ -241,6 +285,8 @@ mod tests {
             body: MessageBody::RaftRequestVote {
                 term: 1,
                 candidate_id: PeerId::from(2),
+                last_log_index: 0,
+                last_log_term: 0,
             },
         });
 
@@ -446,8 +492,10 @@ mod tests {
         let peer_2_messages = vec![
             peer_2_receiver.try_recv().unwrap(),
             peer_2_receiver.try_recv().unwrap(),
+            peer_2_receiver.try_recv().unwrap(),
         ];
         let peer_3_messages = vec![
+            peer_3_receiver.try_recv().unwrap(),
             peer_3_receiver.try_recv().unwrap(),
             peer_3_receiver.try_recv().unwrap(),
         ];
@@ -460,10 +508,14 @@ mod tests {
                 entries,
                 leader_commit: 0,
                 ..
-            } if entries.len() == 1
+            } if entries.len() == 2
                 && entries[0].entry.term == 1
                 && entries[0].entry.index == 1
-                && !entries[0].block_file.is_empty()
+                && entries[0].entry.is_noop()
+                && entries[0].block_file.is_empty()
+                && entries[1].entry.term == 1
+                && entries[1].entry.index == 2
+                && !entries[1].block_file.is_empty()
         )));
         assert!(peer_3_messages.iter().any(|message| matches!(
             &message.body,
@@ -474,10 +526,14 @@ mod tests {
                 entries,
                 leader_commit: 0,
                 ..
-            } if entries.len() == 1
+            } if entries.len() == 2
                 && entries[0].entry.term == 1
                 && entries[0].entry.index == 1
-                && !entries[0].block_file.is_empty()
+                && entries[0].entry.is_noop()
+                && entries[0].block_file.is_empty()
+                && entries[1].entry.term == 1
+                && entries[1].entry.index == 2
+                && !entries[1].block_file.is_empty()
         )));
         assert!(!network.get_broadcasted_messages().iter().any(|message| {
             matches!(

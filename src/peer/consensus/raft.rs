@@ -2,14 +2,15 @@ use crate::config::{
     DEFAULT_RAFT_ELECTION_TIMEOUT, DEFAULT_RAFT_ELECTION_TIMEOUT_JITTER,
     DEFAULT_RAFT_HEARTBEAT_INTERVAL,
 };
+use crate::crypto::KeyManager;
 use crate::peer::MessageBody;
 use crate::peer::PeerId;
-use crate::peer::consensus::raft_log_store::{InMemoryRaftLogStore, RaftLogStorage};
-use crate::peer::consensus::{
-    ConsensusEffect, ConsensusState, RaftLogEntry, RaftRoleState, ValidatedRaftBlock,
-};
-use crate::storage::{BlockFile, BlockHash};
+use crate::peer::RaftReplicatedBlock;
+use crate::peer::consensus::raft_log_store::{AnyRaftLogStore, InMemoryRaftLogStore};
+use crate::peer::consensus::{ConsensusEffect, ConsensusState};
+use crate::storage::{BlockFile, BlockHash, EMPTY_HASH};
 use crate::transactions::SignedTransaction;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
@@ -31,13 +32,41 @@ pub enum VoteResponse {
     Rejected,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RaftLogEntry {
+    pub term: u64,
+    pub index: u64,
+    pub block_hash: BlockHash,
+}
+
+impl RaftLogEntry {
+    pub fn noop(term: u64, index: u64) -> Self {
+        Self {
+            term,
+            index,
+            block_hash: EMPTY_HASH,
+        }
+    }
+
+    pub fn is_noop(&self) -> bool {
+        self.block_hash == EMPTY_HASH
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RaftRoleState {
+    Follower,
+    Candidate,
+    Leader,
+}
+
 struct AppendEntriesRequest {
     term: u64,
     leader_id: PeerId,
     prev_log_index: u64,
     prev_log_term: u64,
-    entries: Vec<RaftLogEntry>,
-    blocks: HashMap<BlockHash, BlockFile>,
+    entries: Vec<RaftReplicatedBlock>,
     leader_commit: u64,
     from: PeerId,
     now: Instant,
@@ -58,7 +87,7 @@ pub struct RaftConsensus {
     last_heartbeat_received_at: Instant,
     last_heartbeat_sent_at: Option<Instant>,
     log: Vec<RaftLogEntry>,
-    raft_log_store: Box<dyn RaftLogStorage>,
+    raft_log_store: AnyRaftLogStore,
     commit_index: u64,
     match_indexes: HashMap<PeerId, u64>,
     pending_blocks: HashMap<BlockHash, BlockFile>,
@@ -66,19 +95,24 @@ pub struct RaftConsensus {
 
 impl RaftConsensus {
     pub fn new(peer_id: PeerId) -> Self {
-        Self::new_with_storage(peer_id, Box::new(InMemoryRaftLogStore::new()), 0)
-            .expect("In-memory Raft log store must be readable")
+        Self::new_with_storage(
+            peer_id,
+            AnyRaftLogStore::InMemory(InMemoryRaftLogStore::new()),
+            0,
+        )
+        .expect("In-memory Raft log store must be readable")
     }
 
     pub(crate) fn new_with_storage(
         peer_id: PeerId,
-        raft_log_store: Box<dyn RaftLogStorage>,
+        raft_log_store: AnyRaftLogStore,
         commit_index: u64,
     ) -> Result<Self, String> {
-        let log = raft_log_store.load()?;
+        let persisted_state = raft_log_store.load()?;
+        let commit_index = persisted_state.commit_index.unwrap_or(commit_index);
         Ok(Self::new_with_log(
             peer_id,
-            log,
+            persisted_state.log,
             commit_index,
             raft_log_store,
         ))
@@ -103,7 +137,7 @@ impl RaftConsensus {
         peer_id: PeerId,
         log: Vec<RaftLogEntry>,
         commit_index: u64,
-        raft_log_store: Box<dyn RaftLogStorage>,
+        raft_log_store: AnyRaftLogStore,
     ) -> Self {
         let participants = HashSet::from([peer_id]);
         let commit_index = commit_index.min(log.last().map(|entry| entry.index).unwrap_or(0));
@@ -136,7 +170,10 @@ impl RaftConsensus {
         client_tx: SignedTransaction,
     ) -> Result<Vec<ConsensusEffect>, String> {
         match self.role {
-            RaftRole::Leader => Ok(vec![ConsensusEffect::StageClientTransaction(client_tx)]),
+            RaftRole::Leader => {
+                self.ensure_no_uncommitted_block()?;
+                Ok(vec![ConsensusEffect::StageClientTransaction(client_tx)])
+            }
             RaftRole::Follower | RaftRole::Candidate => self.forward_client_transaction(client_tx),
         }
     }
@@ -166,13 +203,17 @@ impl RaftConsensus {
         }
 
         if now.duration_since(self.last_heartbeat_received_at) >= self.current_election_timeout {
-            self.start_election_at(now);
-            return Ok(vec![ConsensusEffect::Broadcast(
-                MessageBody::RaftRequestVote {
-                    term: self.current_term,
-                    candidate_id: self.peer_id,
-                },
-            )]);
+            let became_leader = self.start_election_at(now);
+            let mut effects = vec![ConsensusEffect::Broadcast(MessageBody::RaftRequestVote {
+                term: self.current_term,
+                candidate_id: self.peer_id,
+                last_log_index: self.last_log_index(),
+                last_log_term: self.last_log_term(),
+            })];
+            if became_leader {
+                effects.extend(self.append_leader_noop()?);
+            }
+            return Ok(effects);
         }
         Ok(Vec::new())
     }
@@ -181,9 +222,11 @@ impl RaftConsensus {
         &mut self,
         term: u64,
         candidate_id: PeerId,
+        last_log_index: u64,
+        last_log_term: u64,
         from: PeerId,
     ) -> Result<Vec<ConsensusEffect>, String> {
-        let response = self.request_vote(term, candidate_id);
+        let response = self.request_vote(term, candidate_id, last_log_index, last_log_term);
         Ok(vec![ConsensusEffect::Send {
             to: from,
             body: MessageBody::RaftRequestVoteResponse {
@@ -200,7 +243,9 @@ impl RaftConsensus {
         vote_granted: bool,
     ) -> Result<Vec<ConsensusEffect>, String> {
         if self.role == RaftRole::Candidate {
-            self.receive_vote(term, voter_id, vote_granted);
+            if self.receive_vote(term, voter_id, vote_granted) {
+                return self.append_leader_noop();
+            }
         } else {
             self.step_down_on_newer_term(term);
         }
@@ -214,30 +259,55 @@ impl RaftConsensus {
         leader_id: PeerId,
         prev_log_index: u64,
         prev_log_term: u64,
-        entries: Vec<ValidatedRaftBlock>,
+        entries: Vec<RaftReplicatedBlock>,
         leader_commit: u64,
         from: PeerId,
         now: Instant,
     ) -> Result<Vec<ConsensusEffect>, String> {
-        let mut blocks = HashMap::with_capacity(entries.len());
-        let entries = entries
-            .into_iter()
-            .map(|validated_block| {
-                blocks.insert(validated_block.entry.block_hash, validated_block.block_file);
-                validated_block.entry
-            })
-            .collect();
         self.handle_append_entries(AppendEntriesRequest {
             term,
             leader_id,
             prev_log_index,
             prev_log_term,
             entries,
-            blocks,
             leader_commit,
             from,
             now,
         })
+    }
+
+    fn validate_replicated_entries(
+        entries: Vec<RaftReplicatedBlock>,
+    ) -> Result<(Vec<RaftLogEntry>, HashMap<BlockHash, BlockFile>), String> {
+        let mut blocks = HashMap::with_capacity(entries.len());
+        let mut log_entries = Vec::with_capacity(entries.len());
+        for replicated_block in entries {
+            if replicated_block.entry.is_noop() {
+                if !replicated_block.block_file.is_empty() {
+                    return Err(format!(
+                        "Raft no-op entry at index {} contains a block payload",
+                        replicated_block.entry.index
+                    ));
+                }
+                KeyManager::verify_message(
+                    &replicated_block.public_key,
+                    &replicated_block.signature,
+                    &replicated_block.block_file,
+                )
+                .map_err(|e| e.to_string())?;
+            } else {
+                let block_file = BlockFile::verify_block_vec(
+                    replicated_block.entry.block_hash,
+                    &replicated_block.block_file,
+                    replicated_block.signature,
+                    replicated_block.public_key,
+                )
+                .map_err(|e| e.to_string())?;
+                blocks.insert(replicated_block.entry.block_hash, block_file);
+            }
+            log_entries.push(replicated_block.entry);
+        }
+        Ok((log_entries, blocks))
     }
 
     pub(super) fn on_append_entries_response(
@@ -248,12 +318,7 @@ impl RaftConsensus {
         match_index: u64,
     ) -> Result<Vec<ConsensusEffect>, String> {
         if self.role == RaftRole::Leader {
-            return Ok(self.handle_leader_append_entries_response(
-                term,
-                from,
-                success,
-                match_index,
-            ));
+            return self.handle_leader_append_entries_response(term, from, success, match_index);
         }
         self.step_down_on_newer_term(term);
         Ok(Vec::new())

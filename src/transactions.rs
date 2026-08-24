@@ -3,7 +3,7 @@ use crate::storage::BlockKeeper;
 use k256::ecdsa::signature::{Signer, Verifier};
 use k256::ecdsa::{Signature, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Display, Formatter};
 
 #[derive(Serialize, Deserialize, Eq, PartialEq, Clone)]
@@ -168,14 +168,23 @@ impl Display for TransactionValidationError {
 #[derive(Default)]
 pub struct TransactionProcessor {
     accounts: HashMap<String, Account>,
+    applied_transactions: HashSet<String>,
 }
 
 impl TransactionProcessor {
+    /// Applying the same transaction twice (e.g. once via direct mempool admission and
+    /// once via replaying a committed block that contains it) is a no-op rather than an
+    /// error, so callers on both the origin peer and other peers can process a
+    /// transaction unconditionally whenever they first see it.
     pub fn process_transaction(
         &mut self,
         client_tx: SignedTransaction,
     ) -> Result<(), TransactionValidationError> {
-        match client_tx.transaction.operation {
+        let tx_id = client_tx.tx_id();
+        if self.applied_transactions.contains(&tx_id) {
+            return Ok(());
+        }
+        let result = match client_tx.transaction.operation {
             Operation::AddCoin { asset_type, amount } => self.add_coin(
                 KeyManager::to_string_hex(&client_tx.public_key),
                 asset_type.clone(),
@@ -191,6 +200,57 @@ impl TransactionProcessor {
                 asset_type,
                 amount,
             ),
+        };
+        if result.is_ok() {
+            self.applied_transactions.insert(tx_id);
+        }
+        result
+    }
+
+    /// Reverses transactions previously applied via `process_transaction`, e.g. when a
+    /// staged block containing them is rolled back instead of committed. Transactions are
+    /// undone in reverse order so chained operations (A sends to B, B then sends to C)
+    /// unwind correctly. A transaction that was never applied (not in
+    /// `applied_transactions`, e.g. it failed validation when first processed) is skipped.
+    pub fn rollback_transactions(&mut self, transactions: &[SignedTransaction]) {
+        for client_tx in transactions.iter().rev() {
+            self.rollback_transaction(client_tx);
+        }
+    }
+
+    fn rollback_transaction(&mut self, client_tx: &SignedTransaction) {
+        let tx_id = client_tx.tx_id();
+        if !self.applied_transactions.remove(&tx_id) {
+            return;
+        }
+        match &client_tx.transaction.operation {
+            Operation::AddCoin { amount, .. } => {
+                self.reverse_add_coin(KeyManager::to_string_hex(&client_tx.public_key), *amount);
+            }
+            Operation::Send {
+                recipient, amount, ..
+            } => {
+                self.reverse_send_coins(
+                    KeyManager::to_string_hex(&client_tx.public_key),
+                    recipient,
+                    *amount,
+                );
+            }
+        }
+    }
+
+    fn reverse_add_coin(&mut self, id: String, amount: u32) {
+        if let Some(account) = self.accounts.get_mut(&id) {
+            account.balance = account.balance.saturating_sub(amount);
+        }
+    }
+
+    fn reverse_send_coins(&mut self, id: String, to: &str, amount: u32) {
+        if let Some(recipient_account) = self.accounts.get_mut(to) {
+            recipient_account.balance = recipient_account.balance.saturating_sub(amount);
+        }
+        if let Some(sender_account) = self.accounts.get_mut(&id) {
+            sender_account.balance += amount;
         }
     }
 

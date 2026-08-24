@@ -4,12 +4,12 @@ mod messages;
 
 pub use crate::config::DEFAULT_CHANNEL_SIZE;
 use crate::network::NetworkInterface;
-use crate::peer::consensus::{
-    ConsensusEffect, ConsensusEngine, ConsensusState, ValidatedRaftBlock,
-};
+use crate::peer::consensus::{ConsensusEffect, ConsensusEngine, ConsensusState};
 use crate::peer::effects::PeerEffects;
 pub use crate::peer::messages::{Message, MessageBody, PeerId, RaftReplicatedBlock, TxPayload};
-use crate::storage::{BlockFile, BlockHash, BlockKeeper, BlockStorageState, BlockStorageView};
+use crate::storage::{
+    BlockFile, BlockHash, BlockKeeper, BlockStatus, BlockStorageState, BlockStorageView,
+};
 use crate::transactions::{SignedTransaction, VerifiedTransaction};
 use k256::ecdsa::{Signature, SigningKey, VerifyingKey};
 use log::debug;
@@ -71,6 +71,12 @@ impl<Network: NetworkInterface> Peer<Network> {
         self.effects.block_keeper_mut()
     }
 
+    /// Validates a block obtained through block synchronization against the local chain
+    /// before staging and committing it, instead of trusting the sync source blindly.
+    pub fn apply_synchronized_block(&mut self, block_file: BlockFile) -> Result<(), String> {
+        self.effects.apply_synchronized_block(block_file)
+    }
+
     pub fn create_state_view(&self) -> PeerStateView {
         PeerStateView {
             peer_id: self.id,
@@ -102,35 +108,7 @@ impl<Network: NetworkInterface> Peer<Network> {
             MessageBody::BlockReject { block_hash } => {
                 self.process_block_vote(block_hash, message.from, false)
             }
-            MessageBody::RaftRequestVote { term, candidate_id } => {
-                self.process_raft_request_vote(term, candidate_id, message.from)
-            }
-            MessageBody::RaftRequestVoteResponse { term, vote_granted } => {
-                self.process_raft_request_vote_response(term, message.from, vote_granted)
-            }
-            MessageBody::RaftAppendEntries {
-                term,
-                leader_id,
-                prev_log_index,
-                prev_log_term,
-                entries,
-                leader_commit,
-            } => self.process_raft_append_entries(
-                term,
-                leader_id,
-                prev_log_index,
-                prev_log_term,
-                entries,
-                leader_commit,
-                message.from,
-            ),
-            MessageBody::RaftAppendEntriesResponse {
-                term,
-                success,
-                match_index,
-            } => {
-                self.process_raft_append_entries_response(term, message.from, success, match_index)
-            }
+            body => self.dispatch_to_consensus(message.from, body),
         } {
             eprintln!("Failed to process message: {e}");
         }
@@ -147,7 +125,9 @@ impl<Network: NetworkInterface> Peer<Network> {
         verified_tx.verify()?;
 
         let client_tx = verified_tx.client_tx;
-        if let Some(block_hash) = self.effects.stage_client_transaction(client_tx)? {
+        if let BlockStatus::NewBlockCreated { block_hash } =
+            self.effects.stage_client_transaction(client_tx)?
+        {
             let effects = self.consensus.on_block_created(block_hash)?;
             self.execute_consensus_effects(effects)?;
         }
@@ -168,13 +148,12 @@ impl<Network: NetworkInterface> Peer<Network> {
 
         let verification_result =
             BlockFile::verify_block_vec(block_hash.clone(), &block_file, signature, public_key);
-        let mut is_ok = false;
-        if let Ok(block_file) = verification_result {
-            is_ok = true;
-            self.effects.stage_external_block(block_file)?;
-            // Probably, we should call synchronization here in else block if the height
+        let is_ok = match verification_result {
+            Ok(block_file) => self.effects.stage_external_block(block_file)?,
+            Err(_) => false,
+            // Probably, we should call synchronization here if the height
             // is less than block_index - 1
-        }
+        };
         let effects = self.consensus.on_block_proposal_validated(
             block_hash,
             from,
@@ -215,83 +194,9 @@ impl<Network: NetworkInterface> Peer<Network> {
         self.execute_consensus_effects(effects)
     }
 
-    fn process_raft_request_vote(
-        &mut self,
-        term: u64,
-        candidate_id: PeerId,
-        from: PeerId,
-    ) -> Result<(), String> {
-        let effects = self.consensus.on_request_vote(term, candidate_id, from)?;
+    fn dispatch_to_consensus(&mut self, from: PeerId, body: MessageBody) -> Result<(), String> {
+        let effects = self.consensus.on_message(from, body, Instant::now())?;
         self.execute_consensus_effects(effects)
-    }
-
-    fn process_raft_request_vote_response(
-        &mut self,
-        term: u64,
-        voter_id: PeerId,
-        vote_granted: bool,
-    ) -> Result<(), String> {
-        let effects = self
-            .consensus
-            .on_request_vote_response(term, voter_id, vote_granted)?;
-        self.execute_consensus_effects(effects)
-    }
-
-    fn process_raft_append_entries(
-        &mut self,
-        term: u64,
-        leader_id: PeerId,
-        prev_log_index: u64,
-        prev_log_term: u64,
-        entries: Vec<RaftReplicatedBlock>,
-        leader_commit: u64,
-        from: PeerId,
-    ) -> Result<(), String> {
-        let validated_blocks = Self::validate_raft_blocks(entries)?;
-        let effects = self.consensus.on_append_entries(
-            term,
-            leader_id,
-            prev_log_index,
-            prev_log_term,
-            validated_blocks,
-            leader_commit,
-            from,
-            Instant::now(),
-        )?;
-        self.execute_consensus_effects(effects)
-    }
-
-    fn process_raft_append_entries_response(
-        &mut self,
-        term: u64,
-        from: PeerId,
-        success: bool,
-        match_index: u64,
-    ) -> Result<(), String> {
-        let effects =
-            self.consensus
-                .on_append_entries_response(term, from, success, match_index)?;
-        self.execute_consensus_effects(effects)
-    }
-
-    fn validate_raft_blocks(
-        entries: Vec<RaftReplicatedBlock>,
-    ) -> Result<Vec<ValidatedRaftBlock>, String> {
-        let mut validated_blocks = Vec::with_capacity(entries.len());
-        for replicated_block in entries {
-            let block_file = BlockFile::verify_block_vec(
-                replicated_block.entry.block_hash,
-                &replicated_block.block_file,
-                replicated_block.signature,
-                replicated_block.public_key,
-            )
-            .map_err(|e| e.to_string())?;
-            validated_blocks.push(ValidatedRaftBlock {
-                entry: replicated_block.entry,
-                block_file,
-            });
-        }
-        Ok(validated_blocks)
     }
 
     pub fn handle_tick(&mut self, now: Instant) -> Result<(), String> {

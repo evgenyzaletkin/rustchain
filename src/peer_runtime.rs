@@ -8,7 +8,7 @@ use crate::crypto::KeyManager;
 use crate::network::NetworkInterface;
 use crate::network::rest_network::RestNetwork;
 use crate::peer::consensus::ConsensusEngine;
-use crate::peer::consensus::raft_log_store::FileRaftLogStore;
+use crate::peer::consensus::raft_log_store::{AnyRaftLogStore, FileRaftLogStore};
 use crate::peer::{Peer, PeerId};
 use crate::server;
 use crate::storage::{BlockKeeper, BlockStorageView};
@@ -153,13 +153,23 @@ pub async fn run_peer(peer_config: PeerConfig) -> Result<(), String> {
             },
             _ = next_interval_tick(&mut sync_interval) => {
                 if let Some(synchronization) = synchronization.as_mut() {
+                    let peer_height = peer
+                        .block_keeper_mut()
+                        .get_block_storage_state()
+                        .read()
+                        .unwrap()
+                        .block_height;
                     synchronization
-                        .check_and_retrieve_missing_blocks(peer.block_keeper_mut())
+                        .check_and_retrieve_missing_blocks(peer_height, |block_file| {
+                            peer.apply_synchronized_block(block_file)
+                        })
                         .await;
                 }
             },
             _ = next_interval_tick(&mut consensus_interval) => {
-                peer.handle_tick(Instant::now())?;
+                if let Err(e) = peer.handle_tick(Instant::now()) {
+                    eprintln!("Failed to process consensus tick: {e}");
+                }
             }
         }
     }
@@ -188,8 +198,13 @@ fn create_raft_consensus(
         .get_block_storage_state()
         .read()
         .map_err(|e| format!("Failed to read block storage state: {}", e))?
-        .block_height as u64;
-    ConsensusEngine::new_raft_with_storage(peer_id, Box::new(raft_log_store), commit_index)
+        .block_height
+        .into();
+    ConsensusEngine::new_raft_with_storage(
+        peer_id,
+        AnyRaftLogStore::File(raft_log_store),
+        commit_index,
+    )
 }
 
 #[cfg(test)]

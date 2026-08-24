@@ -241,6 +241,92 @@ mod tests {
         assert_eq!(processor.get_account(&sender_id).unwrap().balance, 10);
     }
 
+    #[test]
+    fn test_process_transaction_is_idempotent_for_the_same_transaction() {
+        let mut processor = TransactionProcessor::default();
+        let sender_key = KeyManager::create_key();
+        let sender_id = KeyManager::to_string_hex(&VerifyingKey::from(&sender_key));
+        let add_coin_tx = create_signed_transaction(
+            &sender_key,
+            Operation::AddCoin {
+                amount: 10,
+                asset_type: AssetType::BTC,
+            },
+            1,
+        );
+
+        processor.process_transaction(add_coin_tx.clone()).unwrap();
+        processor.process_transaction(add_coin_tx).unwrap();
+
+        assert_eq!(processor.get_account(&sender_id).unwrap().balance, 10);
+    }
+
+    #[test]
+    fn test_rollback_transactions_reverses_add_coin() {
+        let mut processor = TransactionProcessor::default();
+        let sender_key = KeyManager::create_key();
+        let sender_id = KeyManager::to_string_hex(&VerifyingKey::from(&sender_key));
+        let add_coin_tx = create_signed_transaction(
+            &sender_key,
+            Operation::AddCoin {
+                amount: 10,
+                asset_type: AssetType::BTC,
+            },
+            1,
+        );
+
+        processor.process_transaction(add_coin_tx.clone()).unwrap();
+        assert_eq!(processor.get_account(&sender_id).unwrap().balance, 10);
+
+        processor.rollback_transactions(&[add_coin_tx.clone()]);
+
+        assert_eq!(processor.get_account(&sender_id).unwrap().balance, 0);
+
+        // The rolled-back transaction is no longer considered applied, so it can be
+        // reprocessed later (e.g. if it gets included in a subsequently committed block).
+        processor.process_transaction(add_coin_tx).unwrap();
+        assert_eq!(processor.get_account(&sender_id).unwrap().balance, 10);
+    }
+
+    #[test]
+    fn test_rollback_transactions_reverses_send_in_reverse_order() {
+        let mut processor = TransactionProcessor::default();
+        let sender_key = KeyManager::create_key();
+        let sender_id = KeyManager::to_string_hex(&VerifyingKey::from(&sender_key));
+        let recipient_key = KeyManager::create_key();
+        let recipient_id = KeyManager::to_string_hex(&VerifyingKey::from(&recipient_key));
+
+        let add_coin_tx = create_signed_transaction(
+            &sender_key,
+            Operation::AddCoin {
+                amount: 20,
+                asset_type: AssetType::BTC,
+            },
+            1,
+        );
+        let send_tx = create_signed_transaction(
+            &sender_key,
+            Operation::Send {
+                recipient: recipient_id.clone(),
+                amount: 15,
+                asset_type: AssetType::BTC,
+            },
+            2,
+        );
+
+        processor.process_transaction(add_coin_tx.clone()).unwrap();
+        processor.process_transaction(send_tx.clone()).unwrap();
+        assert_eq!(processor.get_account(&sender_id).unwrap().balance, 5);
+        assert_eq!(processor.get_account(&recipient_id).unwrap().balance, 15);
+
+        // Simulates rolling back a whole rejected block: transactions are undone in
+        // reverse of the order they were applied.
+        processor.rollback_transactions(&[add_coin_tx, send_tx]);
+
+        assert_eq!(processor.get_account(&sender_id).unwrap().balance, 0);
+        assert_eq!(processor.get_account(&recipient_id).unwrap().balance, 0);
+    }
+
     fn create_signed_transaction(
         signing_key: &SigningKey,
         operation: Operation,

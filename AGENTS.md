@@ -8,10 +8,10 @@ The codebase is intentionally split by responsibility. Preserve those boundaries
 
 ## Main Modules
 
-- `src/peer.rs`: peer message routing and orchestration. `Peer` validates incoming payloads, delegates decisions to `ConsensusEngine`, executes effects through `PeerEffects`, and publishes consensus state snapshots through a Tokio watch channel.
+- `src/peer.rs`: peer message routing and orchestration. `Peer` validates and stages payloads that require `PeerEffects` before consensus can decide anything (client transactions, synchronized transactions, block proposals), executes effects through `PeerEffects`, and publishes consensus state snapshots through a Tokio watch channel. `Peer` is intentionally unaware of consensus-mode details: every message that needs no pre-consensus validation (votes, Raft RPCs) is forwarded as-is through `ConsensusEngine::on_message`, so adding or changing a consensus mode's wire protocol never requires touching `peer.rs`.
 - `src/peer/effects.rs`: owns peer-side services and executes `ConsensusEffect`s. It owns transaction processing, block storage, signing, network delivery, commits, and rollbacks.
 - `src/peer/messages.rs`: peer message types and message payload structures.
-- `src/peer/consensus.rs`: consensus abstraction. `ConsensusEngine` exposes typed event handlers that return `ConsensusEffect`s.
+- `src/peer/consensus.rs`: consensus abstraction. `ConsensusEngine` exposes typed event handlers that return `ConsensusEffect`s, plus `on_message` — the single dispatch entrypoint `Peer` uses for messages it doesn't need to pre-validate.
 - `src/peer/consensus/voting.rs`: current voting-based block approval logic.
 - `src/peer/consensus/raft.rs`: Raft state, typed event dispatch, and accepted pending block payloads.
 - `src/peer/consensus/raft/election.rs`: Raft membership, elections, votes, and leader tracking.
@@ -41,12 +41,14 @@ Supported modes:
 
 Raft log replication is implemented, but it is still a first-pass implementation. Current limitations include: `current_term` and `voted_for` are not persisted, snapshots are not implemented, conflict optimization is simplified, and membership is still based on known peers rather than formal Raft configuration changes.
 
+Uncommitted block payloads are intentionally kept in memory in both Raft and voting/BFT-style consensus. Only committed blocks are durable. This is an accepted simplification: a crash may lose an accepted or proposed block payload even when related consensus metadata survives, so crash recovery of in-flight blocks is not guaranteed. Do not add durable pending-block storage or embed block payloads in the Raft log unless explicitly requested.
+
 Raft-specific boundaries:
 
 - Consensus must not perform network side effects.
 - Raft consensus owns Raft log persistence through `RaftLogStorage`.
 - `Peer` must not own or instantiate Raft log storage.
-- `Peer` validates received Raft block payloads and passes them to consensus without retaining them.
+- Raft consensus validates received replicated block payloads (signature, hash, noop/payload consistency) itself, inside `RaftConsensus::on_append_entries`; `Peer` never inspects or retains them.
 - Raft consensus owns accepted pending block payloads until `ConsensusEffect::StageRaftEntries` is executed; only then may the executor stage them in `BlockKeeper`.
 - `BlockFile::verify_block_vec` / `BlockFile::verify_block` validate signature, hash, and internal block content only.
 - `BlockKeeper::block_can_be_added` owns the current-chain or staged-chain previous-hash check.

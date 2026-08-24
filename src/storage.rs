@@ -53,9 +53,12 @@ pub struct BlockFile {
     transactions: Vec<SignedTransaction>,
 }
 
-impl From<&Vec<u8>> for BlockFile {
-    fn from(block_file_vec: &Vec<u8>) -> Self {
-        serde_json::from_slice(&block_file_vec).unwrap()
+impl TryFrom<&Vec<u8>> for BlockFile {
+    type Error = BlockVerificationError;
+
+    fn try_from(block_file_vec: &Vec<u8>) -> Result<Self, Self::Error> {
+        serde_json::from_slice(block_file_vec)
+            .map_err(|e| BlockVerificationError::DeserializationError(e.to_string()))
     }
 }
 
@@ -83,15 +86,19 @@ impl BlockFile {
         BlockHash(hasher.finalize().into())
     }
 
+    pub fn transactions(&self) -> &[SignedTransaction] {
+        &self.transactions
+    }
+
     fn read_from_disk(block_path: &PathBuf) -> Result<Self, String> {
-        let block_contents = fs::read_to_string(block_path).map_err(|e| {
+        let block_contents = fs::read(block_path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 format!("Block file not found: {}", block_path.display())
             } else {
                 format!("Failed to read block file {}: {}", block_path.display(), e)
             }
         })?;
-        serde_json::from_str::<BlockFile>(&block_contents).map_err(|e| {
+        serde_json::from_slice::<BlockFile>(&block_contents).map_err(|e| {
             format!(
                 "Failed to deserialize block file {}: {}",
                 block_path.display(),
@@ -115,7 +122,7 @@ impl BlockFile {
         public_key: VerifyingKey,
     ) -> Result<Self, BlockVerificationError> {
         KeyManager::verify_message(&public_key, &signature, block_file_vec)?;
-        let block_file: BlockFile = block_file_vec.into();
+        let block_file: BlockFile = block_file_vec.try_into()?;
         if block_hash != block_file.hash {
             return Err(BlockVerificationError::InvalidBlockHash);
         }
@@ -147,7 +154,7 @@ pub enum BlockStatus {
 #[derive(Debug, Display)]
 pub enum BlockVerificationError {
     SignatureError(signature::Error),
-    DeserializationError(serde_json::Error),
+    DeserializationError(String),
     InvalidBlockHash,
     InvalidPreviousHash,
     AlreadyAdded,
@@ -156,12 +163,6 @@ pub enum BlockVerificationError {
 impl From<signature::Error> for BlockVerificationError {
     fn from(err: signature::Error) -> Self {
         BlockVerificationError::SignatureError(err)
-    }
-}
-
-impl From<serde_json::Error> for BlockVerificationError {
-    fn from(err: serde_json::Error) -> Self {
-        BlockVerificationError::DeserializationError(err)
     }
 }
 
@@ -335,6 +336,16 @@ impl BlockKeeper {
         BlockFile::read_from_disk_by_index(&self.path_to_blocks, index)
     }
 
+    pub fn read_block_by_hash(&self, block_hash: &BlockHash) -> Result<BlockFile, String> {
+        for block_filename in self.list_all_blocks() {
+            let block_file = BlockFile::read_from_disk(&self.path_to_blocks.join(&block_filename))?;
+            if block_file.hash == *block_hash {
+                return Ok(block_file);
+            }
+        }
+        Err(format!("Block with hash {} not found", block_hash))
+    }
+
     pub fn read_transactions_from_disk(
         &self,
         block_filename: &str,
@@ -347,6 +358,10 @@ impl BlockKeeper {
     }
 
     pub fn block_can_be_added(&self, block_file: &BlockFile) -> bool {
+        if block_file.index == 0 {
+            return false;
+        }
+
         let storage_state = self.block_storage_state.read().unwrap();
         if self.uncommited_blocks.contains_key(&block_file.hash) {
             return false;
@@ -423,6 +438,10 @@ mod tests {
             assert_eq!(block_file.transactions.len(), 1);
             assert!(block_file.transactions.contains(&client_transaction));
             assert_eq!(block_file.index, 1);
+            assert_eq!(
+                block_keeper.read_block_by_hash(&block_hash).unwrap().hash,
+                block_hash
+            );
         } else {
             panic!("New block not created");
         }

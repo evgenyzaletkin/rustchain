@@ -4,36 +4,17 @@ pub(crate) mod raft_log_store;
 mod voting;
 
 use crate::peer::consensus::raft::RaftConsensus;
-use crate::peer::consensus::raft_log_store::RaftLogStorage;
-use crate::peer::{MessageBody, PeerId};
+use crate::peer::consensus::raft_log_store::AnyRaftLogStore;
+use crate::peer::{MessageBody, PeerId, RaftReplicatedBlock};
 use crate::storage::{BlockFile, BlockHash};
 use crate::transactions::SignedTransaction;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::collections::HashMap;
 use std::time::Instant;
 
+pub use raft::{RaftLogEntry, RaftRoleState};
 #[allow(unused_imports)]
 pub use voting::{ConsensusOutcome, VotingConsensus};
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct RaftLogEntry {
-    pub term: u64,
-    pub index: u64,
-    pub block_hash: BlockHash,
-}
-
-pub struct ValidatedRaftBlock {
-    pub entry: RaftLogEntry,
-    pub block_file: BlockFile,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum RaftRoleState {
-    Follower,
-    Candidate,
-    Leader,
-}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "mode", rename_all = "lowercase")]
@@ -92,7 +73,7 @@ impl ConsensusEngine {
 
     pub(crate) fn new_raft_with_storage(
         peer_id: PeerId,
-        raft_log_store: Box<dyn RaftLogStorage>,
+        raft_log_store: AnyRaftLogStore,
         commit_index: u64,
     ) -> Result<Self, String> {
         Ok(Self::Raft(RaftConsensus::new_with_storage(
@@ -204,11 +185,15 @@ impl ConsensusEngine {
         &mut self,
         term: u64,
         candidate_id: PeerId,
+        last_log_index: u64,
+        last_log_term: u64,
         from: PeerId,
     ) -> Result<Vec<ConsensusEffect>, String> {
         match self {
             Self::Voting { .. } => Ok(Vec::new()),
-            Self::Raft(raft) => raft.on_request_vote(term, candidate_id, from),
+            Self::Raft(raft) => {
+                raft.on_request_vote(term, candidate_id, last_log_index, last_log_term, from)
+            }
         }
     }
 
@@ -231,7 +216,7 @@ impl ConsensusEngine {
         leader_id: PeerId,
         prev_log_index: u64,
         prev_log_term: u64,
-        entries: Vec<ValidatedRaftBlock>,
+        entries: Vec<RaftReplicatedBlock>,
         leader_commit: u64,
         from: PeerId,
         now: Instant,
@@ -268,6 +253,54 @@ impl ConsensusEngine {
         match self {
             Self::Voting { .. } => None,
             Self::Raft(raft) => raft.take_pending_block(block_hash),
+        }
+    }
+
+    /// Dispatches a message that requires no validation beyond what consensus itself
+    /// performs. `Peer` routes here for every message kind it doesn't need to validate
+    /// or stage via `PeerEffects` first (client transactions, synchronization, and raw
+    /// block proposals are handled by `Peer` directly and never reach this method).
+    pub fn on_message(
+        &mut self,
+        from: PeerId,
+        body: MessageBody,
+        now: Instant,
+    ) -> Result<Vec<ConsensusEffect>, String> {
+        match body {
+            MessageBody::RaftRequestVote {
+                term,
+                candidate_id,
+                last_log_index,
+                last_log_term,
+            } => self.on_request_vote(term, candidate_id, last_log_index, last_log_term, from),
+            MessageBody::RaftRequestVoteResponse { term, vote_granted } => {
+                self.on_request_vote_response(term, from, vote_granted)
+            }
+            MessageBody::RaftAppendEntries {
+                term,
+                leader_id,
+                prev_log_index,
+                prev_log_term,
+                entries,
+                leader_commit,
+            } => self.on_append_entries(
+                term,
+                leader_id,
+                prev_log_index,
+                prev_log_term,
+                entries,
+                leader_commit,
+                from,
+                now,
+            ),
+            MessageBody::RaftAppendEntriesResponse {
+                term,
+                success,
+                match_index,
+            } => self.on_append_entries_response(term, from, success, match_index),
+            other => Err(format!(
+                "{other} must be validated by Peer before reaching consensus"
+            )),
         }
     }
 }

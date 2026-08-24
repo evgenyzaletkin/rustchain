@@ -7,7 +7,7 @@ use std::time::Instant;
 impl RaftConsensus {
     pub(super) fn handle_append_entries(
         &mut self,
-        mut request: AppendEntriesRequest,
+        request: AppendEntriesRequest,
     ) -> Result<Vec<ConsensusEffect>, String> {
         if !self.receive_append_entries_at(
             request.term,
@@ -18,29 +18,36 @@ impl RaftConsensus {
             return Ok(vec![self.append_entries_response(
                 request.from,
                 false,
-                self.matching_index_for(
-                    request.prev_log_index,
-                    request.prev_log_term,
-                    &request.entries,
-                ),
+                self.matching_index_for(request.prev_log_index, request.prev_log_term, &[]),
             )]);
         }
 
-        let match_index = self.matching_index_for(
-            request.prev_log_index,
-            request.prev_log_term,
-            &request.entries,
-        );
-        let accepted_match_index = request
-            .entries
+        let (log_entries, mut blocks) = match Self::validate_replicated_entries(request.entries) {
+            Ok(validated) => validated,
+            Err(e) => {
+                log::warn!("Rejecting Raft append entries from {}: {e}", request.from);
+                let match_index =
+                    self.matching_index_for(request.prev_log_index, request.prev_log_term, &[]);
+                return Ok(vec![self.append_entries_response(
+                    request.from,
+                    false,
+                    match_index,
+                )]);
+            }
+        };
+
+        let match_index =
+            self.matching_index_for(request.prev_log_index, request.prev_log_term, &log_entries);
+        let accepted_match_index = log_entries
             .last()
             .map(|entry| entry.index)
             .unwrap_or(request.prev_log_index);
         let log_changed = accepted_match_index > request.prev_log_index;
+        let previous_commit_index = self.commit_index;
         let Some(mut effects) = self.append_entries(
             request.prev_log_index,
             request.prev_log_term,
-            request.entries,
+            log_entries,
             request.leader_commit,
         ) else {
             return Ok(vec![self.append_entries_response(
@@ -53,24 +60,26 @@ impl RaftConsensus {
         for effect in &effects {
             if let ConsensusEffect::StageRaftEntries(entries) = effect {
                 for entry in entries {
-                    if let Some(block_file) = request.blocks.remove(&entry.block_hash) {
+                    if !entry.is_noop()
+                        && let Some(block_file) = blocks.remove(&entry.block_hash)
+                    {
                         self.pending_blocks.insert(entry.block_hash, block_file);
                     }
                 }
             }
         }
 
-        effects.insert(
-            0,
-            self.append_entries_response(request.from, true, accepted_match_index),
-        );
-        if log_changed {
+        // The ack is appended last, not first: `PeerEffects::execute_all` runs effects in
+        // order and stops at the first error, so the leader only learns this follower
+        // replicated successfully once staging/commit/rollback have actually executed.
+        effects.push(self.append_entries_response(request.from, true, accepted_match_index));
+        if log_changed || self.commit_index != previous_commit_index {
             self.persist_log()?;
         }
         Ok(effects)
     }
 
-    fn append_entries_response(
+    pub(super) fn append_entries_response(
         &self,
         to: PeerId,
         success: bool,
@@ -105,13 +114,29 @@ impl RaftConsensus {
         let entries_to_stage: Vec<_> = entries
             .iter()
             .copied()
-            .filter(|entry| entry.index > previous_commit_index)
+            .filter(|entry| entry.index > previous_commit_index && !entry.is_noop())
             .collect();
 
+        let mut discarded_block_hashes = Vec::new();
         for entry in entries {
             if let Some(existing) = self.log_entry(entry.index) {
                 if existing.term != entry.term {
-                    self.log.truncate((entry.index - 1) as usize);
+                    // The leader is safe to trust once the log-matching check above has
+                    // passed, but a conflicting suffix must never reach into already
+                    // committed history.
+                    if entry.index <= self.commit_index {
+                        return None;
+                    }
+                    let truncate_at = usize::try_from(entry.index - 1)
+                        .expect("Raft log index does not fit in usize");
+                    discarded_block_hashes.extend(
+                        self.log
+                            .iter()
+                            .skip(truncate_at)
+                            .filter(|discarded| !discarded.is_noop())
+                            .map(|discarded| discarded.block_hash),
+                    );
+                    self.log.truncate(truncate_at);
                     self.log.push(entry);
                 }
             } else if entry.index == self.last_log_index() + 1 {
@@ -122,7 +147,10 @@ impl RaftConsensus {
         self.commit_index = self
             .commit_index
             .max(leader_commit.min(self.last_log_index()));
-        let mut effects = Vec::new();
+        let mut effects: Vec<ConsensusEffect> = discarded_block_hashes
+            .into_iter()
+            .map(ConsensusEffect::RollbackBlock)
+            .collect();
         if !entries_to_stage.is_empty() {
             effects.push(ConsensusEffect::StageRaftEntries(entries_to_stage));
         }
@@ -132,6 +160,7 @@ impl RaftConsensus {
                 .filter(|entry| {
                     entry.index > previous_commit_index && entry.index <= self.commit_index
                 })
+                .filter(|entry| !entry.is_noop())
                 .map(|entry| ConsensusEffect::CommitBlock(entry.block_hash)),
         );
         Some(effects)
@@ -139,6 +168,10 @@ impl RaftConsensus {
 
     pub(super) fn last_log_index(&self) -> u64 {
         self.log.last().map(|entry| entry.index).unwrap_or(0)
+    }
+
+    pub(super) fn last_log_term(&self) -> u64 {
+        self.log.last().map(|entry| entry.term).unwrap_or(0)
     }
 
     fn term_at(&self, index: u64) -> Option<u64> {
@@ -173,7 +206,7 @@ impl RaftConsensus {
     }
 
     fn persist_log(&mut self) -> Result<(), String> {
-        self.raft_log_store.save(&self.log)
+        self.raft_log_store.save(&self.log, self.commit_index)
     }
 
     pub(super) fn heartbeat_due(&self, now: Instant) -> bool {
@@ -187,35 +220,41 @@ impl RaftConsensus {
         from: PeerId,
         success: bool,
         match_index: u64,
-    ) -> Vec<ConsensusEffect> {
+    ) -> Result<Vec<ConsensusEffect>, String> {
         if term > self.current_term {
             self.step_down(term);
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         if term != self.current_term || !self.participants.contains(&from) {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
         if success {
             let current_match_index = self.match_indexes.entry(from).or_insert(0);
             *current_match_index = (*current_match_index).max(match_index);
-            return self.advance_commit_index();
+            let previous_commit_index = self.commit_index;
+            let effects = self.advance_commit_index();
+            if self.commit_index != previous_commit_index {
+                self.persist_log()?;
+            }
+            return Ok(effects);
         }
 
         let match_index = match_index.min(self.last_log_index());
         self.match_indexes.insert(from, match_index);
         if match_index >= self.last_log_index() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
-        self.append_entries_effect_for(from).into_iter().collect()
+        Ok(self.append_entries_effect_for(from).into_iter().collect())
     }
 
     pub(super) fn append_local_block(
         &mut self,
         block_hash: BlockHash,
     ) -> Result<Vec<ConsensusEffect>, String> {
+        self.ensure_no_uncommitted_block()?;
         let entry = RaftLogEntry {
             term: self.current_term,
             index: self.last_log_index() + 1,
@@ -223,10 +262,31 @@ impl RaftConsensus {
         };
         self.log.push(entry);
         self.match_indexes.insert(self.peer_id, entry.index);
-        self.persist_log()?;
         let mut effects = self.append_entries_effects_for_followers();
         effects.extend(self.advance_commit_index());
+        self.persist_log()?;
         Ok(effects)
+    }
+
+    pub(super) fn append_leader_noop(&mut self) -> Result<Vec<ConsensusEffect>, String> {
+        let entry = RaftLogEntry::noop(self.current_term, self.last_log_index() + 1);
+        self.log.push(entry);
+        self.match_indexes.insert(self.peer_id, entry.index);
+        let mut effects = self.append_entries_effects_for_followers();
+        effects.extend(self.advance_commit_index());
+        self.persist_log()?;
+        Ok(effects)
+    }
+
+    pub(super) fn ensure_no_uncommitted_block(&self) -> Result<(), String> {
+        if self
+            .log
+            .iter()
+            .any(|entry| entry.index > self.commit_index && !entry.is_noop())
+        {
+            return Err("Raft leader already has an uncommitted block".to_string());
+        }
+        Ok(())
     }
 
     fn advance_commit_index(&mut self) -> Vec<ConsensusEffect> {
@@ -254,6 +314,7 @@ impl RaftConsensus {
         self.log
             .iter()
             .filter(|entry| entry.index > previous_commit_index && entry.index <= self.commit_index)
+            .filter(|entry| !entry.is_noop())
             .map(|entry| ConsensusEffect::CommitBlock(entry.block_hash))
             .collect()
     }

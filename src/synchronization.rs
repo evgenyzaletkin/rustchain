@@ -1,6 +1,6 @@
 use crate::network::{NetworkInterface, NetworkMessage};
 use crate::peer::PeerId;
-use crate::storage::{BlockFile, BlockKeeper, BlockStorageState};
+use crate::storage::{BlockFile, BlockStorageState};
 use crate::synchronization::SyncState::{FAIL, SUCCESS};
 use log::{debug, error, trace};
 use rand::Rng;
@@ -54,18 +54,18 @@ impl<N: NetworkInterface> Synchronization<N> {
         }
     }
 
+    /// `peer_height` is the caller's current committed height. `apply_block` is handed
+    /// each fetched block in order and must validate it against the local chain (not
+    /// just trust the sync source) before staging and committing it; a fetched block that
+    /// fails to apply is treated the same as a failed fetch and counts toward the retry
+    /// budget.
     pub async fn check_and_retrieve_missing_blocks(
         &mut self,
-        block_keeper: &mut BlockKeeper,
+        peer_height: u32,
+        mut apply_block: impl FnMut(BlockFile) -> Result<(), String>,
     ) -> SyncState {
         debug!("Checking other peers for new blocks");
         let latest_states = self.get_latest_indexes().await;
-
-        let peer_height = block_keeper
-            .get_block_storage_state()
-            .read()
-            .unwrap()
-            .block_height;
         let peers_states = PeersStates::new(latest_states);
 
         debug!(
@@ -89,13 +89,15 @@ impl<N: NetworkInterface> Synchronization<N> {
                 return FAIL;
             }
             if let Some(block_file) = self.get_block_file(idx, &peers_states).await {
-                let block_hash = block_file.hash.clone();
                 debug!("Adding block {} from peer", idx);
-                block_keeper.add_external_block(block_file).unwrap();
-                block_keeper.commit_block(&block_hash).unwrap();
-                debug!("Block {} added and commited", idx);
-                idx += 1;
-                continue;
+                match apply_block(block_file) {
+                    Ok(()) => {
+                        debug!("Block {} added and commited", idx);
+                        idx += 1;
+                        continue;
+                    }
+                    Err(e) => error!("Failed to apply synchronized block {idx}: {e}"),
+                }
             }
             errors_count += 1;
             error!("Failed to get block {idx} from other peers, errors: {errors_count}");
@@ -163,7 +165,7 @@ mod tests {
     use super::*;
     use crate::crypto::KeyManager;
     use crate::network::local_network::LocalNetwork;
-    use crate::storage::{BlockHash, BlockStatus};
+    use crate::storage::{BlockHash, BlockKeeper, BlockStatus};
     use crate::transactions::{AssetType, Metadata, Operation, SignedTransaction, Transaction};
     use k256::ecdsa::SigningKey;
     use std::fs;
@@ -218,8 +220,25 @@ mod tests {
         let network = Arc::new(network);
         let mut synchronization = Synchronization::new(network);
 
+        let peer_height = target_keeper
+            .get_block_storage_state()
+            .read()
+            .unwrap()
+            .block_height;
         let result = synchronization
-            .check_and_retrieve_missing_blocks(&mut target_keeper)
+            .check_and_retrieve_missing_blocks(peer_height, |block_file| {
+                if !target_keeper.block_can_be_added(&block_file) {
+                    return Err(format!(
+                        "block {} does not extend the local chain",
+                        block_file.hash
+                    ));
+                }
+                let block_hash = block_file.hash;
+                target_keeper
+                    .add_external_block(block_file)
+                    .map_err(|e| e.to_string())?;
+                target_keeper.commit_block(&block_hash)
+            })
             .await;
 
         assert!(matches!(result, SyncState::SUCCESS));

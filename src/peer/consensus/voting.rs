@@ -44,25 +44,40 @@ impl VotingConsensus {
             return outcome;
         }
 
-        if self.participants.contains(&peer_id) {
-            if approve {
-                self.approvals.insert(peer_id);
-            } else {
-                self.rejections.insert(peer_id);
-            }
-
-            let total_peers = self.participants.len();
-            let f = (total_peers - 1) / 3;
-            if self.approvals.len() >= 2 * f + 1 {
-                self.outcome = Some(ConsensusOutcome::Approved);
-                return ConsensusOutcome::Approved;
-            } else if self.rejections.len() >= f {
-                self.outcome = Some(ConsensusOutcome::Rejected);
-                return ConsensusOutcome::Rejected;
-            }
+        if !self.participants.contains(&peer_id) {
+            return ConsensusOutcome::Pending;
         }
 
-        ConsensusOutcome::Pending
+        if approve {
+            self.approvals.insert(peer_id);
+        } else {
+            self.rejections.insert(peer_id);
+        }
+
+        let outcome = Self::evaluate_outcome(
+            self.participants.len(),
+            self.approvals.len(),
+            self.rejections.len(),
+        );
+        if outcome != ConsensusOutcome::Pending {
+            self.outcome = Some(outcome);
+        }
+        outcome
+    }
+
+    fn evaluate_outcome(
+        total_peers: usize,
+        approvals: usize,
+        rejections: usize,
+    ) -> ConsensusOutcome {
+        let f = (total_peers - 1) / 3;
+        if approvals >= 2 * f + 1 {
+            ConsensusOutcome::Approved
+        } else if rejections >= f {
+            ConsensusOutcome::Rejected
+        } else {
+            ConsensusOutcome::Pending
+        }
     }
 }
 

@@ -35,11 +35,7 @@ impl TryInto<u16> for PeerId {
     type Error = String;
 
     fn try_into(self) -> Result<u16, Self::Error> {
-        if self.0 > u16::MAX as u32 {
-            Err(format!("PeerId is too big: {}", self.0))
-        } else {
-            Ok(self.0 as u16)
-        }
+        u16::try_from(self.0).map_err(|_| format!("PeerId is too big: {}", self.0))
     }
 }
 
@@ -73,7 +69,12 @@ pub enum MessageBody {
     #[display("BlockApproved")]
     BlockApproved { block_hash: BlockHash },
     #[display("RaftRequestVote")]
-    RaftRequestVote { term: u64, candidate_id: PeerId },
+    RaftRequestVote {
+        term: u64,
+        candidate_id: PeerId,
+        last_log_index: u64,
+        last_log_term: u64,
+    },
     #[display("RaftRequestVoteResponse")]
     RaftRequestVoteResponse { term: u64, vote_granted: bool },
     #[display("RaftAppendEntries")]
@@ -115,6 +116,8 @@ mod tests {
             body: MessageBody::RaftRequestVote {
                 term: 7,
                 candidate_id: PeerId::from(1),
+                last_log_index: 5,
+                last_log_term: 6,
             },
         };
 
@@ -124,7 +127,12 @@ mod tests {
             json!({
                 "from": 1,
                 "to": 2,
-                "body": {"RaftRequestVote": {"term": 7, "candidate_id": 1}}
+                "body": {"RaftRequestVote": {
+                    "term": 7,
+                    "candidate_id": 1,
+                    "last_log_index": 5,
+                    "last_log_term": 6
+                }}
             })
         );
     }

@@ -66,8 +66,8 @@ impl HttpDiscoveryClient {
 impl DiscoveryClient for HttpDiscoveryClient {
     async fn register(&self, peer_id: PeerId, addr: SocketAddr) -> Result<(), String> {
         self.send_message(&NetworkMessage::Register(RegisterRequest { peer_id, addr }))
-            .await
-            .map(|_| ())
+            .await?;
+        Ok(())
     }
 
     async fn peers(&self) -> Result<Vec<PeerWithAddr>, String> {
