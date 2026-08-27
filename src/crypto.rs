@@ -1,5 +1,5 @@
 use k256::ecdsa::signature::{Signer, Verifier};
-use k256::ecdsa::{signature, Signature, SigningKey, VerifyingKey};
+use k256::ecdsa::{Signature, SigningKey, VerifyingKey, signature};
 use serde::Serialize;
 use std::fs;
 use std::path::PathBuf;
@@ -8,9 +8,7 @@ pub struct KeyManager {}
 
 const KEY_FILE_NAME: &str = "private_key.bin";
 
-pub trait Signable: Serialize {
-}
-
+pub trait Signable: Serialize {}
 
 impl KeyManager {
     pub fn get_or_create_key(key_dir: &PathBuf) -> SigningKey {

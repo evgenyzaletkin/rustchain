@@ -1,0 +1,251 @@
+use crate::peer::MessageBody;
+use crate::peer::PeerId;
+use crate::peer::consensus::ConsensusEffect;
+use crate::storage::BlockHash;
+use std::collections::HashMap;
+use std::collections::HashSet;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConsensusOutcome {
+    Pending,
+    Approved,
+    Rejected,
+}
+
+pub struct VotingConsensus {
+    participants: HashSet<PeerId>,
+    approvals: HashSet<PeerId>,
+    rejections: HashSet<PeerId>,
+    outcome: Option<ConsensusOutcome>,
+}
+
+impl VotingConsensus {
+    pub fn new(peer_id: PeerId, known_peers: &[PeerId]) -> VotingConsensus {
+        let mut participants: HashSet<PeerId> = HashSet::from_iter(known_peers.iter().copied());
+        participants.insert(peer_id);
+        VotingConsensus {
+            approvals: HashSet::with_capacity(participants.len()),
+            rejections: HashSet::with_capacity(participants.len()),
+            participants,
+            outcome: None,
+        }
+    }
+
+    pub fn outcome(&self) -> Option<ConsensusOutcome> {
+        self.outcome
+    }
+
+    pub fn already_voted(&self, peer_id: &PeerId) -> bool {
+        self.approvals.contains(peer_id) || self.rejections.contains(peer_id)
+    }
+
+    pub fn make_vote(&mut self, peer_id: PeerId, approve: bool) -> ConsensusOutcome {
+        if let Some(outcome) = self.outcome {
+            return outcome;
+        }
+
+        if !self.participants.contains(&peer_id) {
+            return ConsensusOutcome::Pending;
+        }
+
+        if approve {
+            self.approvals.insert(peer_id);
+        } else {
+            self.rejections.insert(peer_id);
+        }
+
+        let outcome = Self::evaluate_outcome(
+            self.participants.len(),
+            self.approvals.len(),
+            self.rejections.len(),
+        );
+        if outcome != ConsensusOutcome::Pending {
+            self.outcome = Some(outcome);
+        }
+        outcome
+    }
+
+    fn evaluate_outcome(
+        total_peers: usize,
+        approvals: usize,
+        rejections: usize,
+    ) -> ConsensusOutcome {
+        let f = (total_peers - 1) / 3;
+        if approvals >= 2 * f + 1 {
+            ConsensusOutcome::Approved
+        } else if rejections >= f {
+            ConsensusOutcome::Rejected
+        } else {
+            ConsensusOutcome::Pending
+        }
+    }
+}
+
+pub fn on_client_transaction(
+    client_tx: crate::transactions::SignedTransaction,
+) -> Vec<ConsensusEffect> {
+    vec![
+        ConsensusEffect::StageClientTransaction(client_tx.clone()),
+        ConsensusEffect::BroadcastClientTransaction(client_tx),
+    ]
+}
+
+pub fn on_block_created(block_hash: BlockHash) -> Vec<ConsensusEffect> {
+    vec![ConsensusEffect::ProposeBlock(block_hash)]
+}
+
+pub fn on_local_block_proposed(
+    peer_id: PeerId,
+    votings: &mut HashMap<BlockHash, VotingConsensus>,
+    block_hash: BlockHash,
+    known_peers: &[PeerId],
+) -> Vec<ConsensusEffect> {
+    handle_voting_vote(peer_id, votings, known_peers, block_hash, peer_id, true)
+}
+
+pub fn on_block_proposal_validated(
+    peer_id: PeerId,
+    votings: &mut HashMap<BlockHash, VotingConsensus>,
+    block_hash: BlockHash,
+    proposer: PeerId,
+    valid: bool,
+    known_peers: &[PeerId],
+) -> Vec<ConsensusEffect> {
+    let mut effects = handle_voting_vote(peer_id, votings, known_peers, block_hash, proposer, true);
+    if effects.is_empty() {
+        effects.extend(handle_voting_vote(
+            peer_id,
+            votings,
+            known_peers,
+            block_hash,
+            peer_id,
+            valid,
+        ));
+    }
+    effects
+}
+
+pub fn on_block_vote(
+    peer_id: PeerId,
+    votings: &mut HashMap<BlockHash, VotingConsensus>,
+    block_hash: BlockHash,
+    from: PeerId,
+    approve: bool,
+    known_peers: &[PeerId],
+) -> Vec<ConsensusEffect> {
+    handle_voting_vote(peer_id, votings, known_peers, block_hash, from, approve)
+}
+
+fn handle_voting_vote(
+    peer_id: PeerId,
+    votings: &mut HashMap<BlockHash, VotingConsensus>,
+    known_peers: &[PeerId],
+    block_hash: BlockHash,
+    from: PeerId,
+    approve: bool,
+) -> Vec<ConsensusEffect> {
+    let consensus = votings
+        .entry(block_hash)
+        .or_insert_with(|| VotingConsensus::new(peer_id, known_peers));
+
+    if consensus.already_voted(&from) || consensus.outcome().is_some() {
+        return Vec::new();
+    }
+
+    match consensus.make_vote(from, approve) {
+        ConsensusOutcome::Approved => vec![
+            ConsensusEffect::CommitBlock(block_hash),
+            ConsensusEffect::Broadcast(MessageBody::BlockApproved { block_hash }),
+        ],
+        ConsensusOutcome::Rejected => vec![
+            ConsensusEffect::RollbackBlock(block_hash),
+            ConsensusEffect::Broadcast(MessageBody::BlockReject { block_hash }),
+        ],
+        ConsensusOutcome::Pending => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ConsensusOutcome, VotingConsensus};
+    use crate::peer::PeerId;
+
+    #[test]
+    fn approves_when_threshold_is_reached() {
+        let known_peers = vec![PeerId::from(2), PeerId::from(3), PeerId::from(4)];
+        let mut consensus = VotingConsensus::new(PeerId::from(1), &known_peers);
+
+        assert_eq!(
+            consensus.make_vote(PeerId::from(1), true),
+            ConsensusOutcome::Pending
+        );
+        assert_eq!(
+            consensus.make_vote(PeerId::from(2), true),
+            ConsensusOutcome::Pending
+        );
+        assert_eq!(
+            consensus.make_vote(PeerId::from(3), true),
+            ConsensusOutcome::Approved
+        );
+        assert_eq!(consensus.outcome(), Some(ConsensusOutcome::Approved));
+    }
+
+    #[test]
+    fn rejects_when_threshold_is_reached() {
+        let known_peers = vec![PeerId::from(2), PeerId::from(3), PeerId::from(4)];
+        let mut consensus = VotingConsensus::new(PeerId::from(1), &known_peers);
+
+        assert_eq!(
+            consensus.make_vote(PeerId::from(2), false),
+            ConsensusOutcome::Rejected
+        );
+        assert_eq!(consensus.outcome(), Some(ConsensusOutcome::Rejected));
+    }
+
+    #[test]
+    fn ignores_votes_from_non_participants() {
+        let known_peers = vec![PeerId::from(2), PeerId::from(3), PeerId::from(4)];
+        let mut consensus = VotingConsensus::new(PeerId::from(1), &known_peers);
+
+        assert_eq!(
+            consensus.make_vote(PeerId::from(99), true),
+            ConsensusOutcome::Pending
+        );
+        assert_eq!(consensus.outcome(), None);
+    }
+
+    #[test]
+    fn tracks_duplicate_votes_without_changing_state() {
+        let known_peers = vec![PeerId::from(2), PeerId::from(3), PeerId::from(4)];
+        let mut consensus = VotingConsensus::new(PeerId::from(1), &known_peers);
+
+        assert_eq!(
+            consensus.make_vote(PeerId::from(1), true),
+            ConsensusOutcome::Pending
+        );
+        assert!(consensus.already_voted(&PeerId::from(1)));
+        assert_eq!(
+            consensus.make_vote(PeerId::from(1), true),
+            ConsensusOutcome::Pending
+        );
+        assert_eq!(
+            consensus.make_vote(PeerId::from(2), true),
+            ConsensusOutcome::Pending
+        );
+    }
+
+    #[test]
+    fn returns_final_outcome_after_consensus_is_reached() {
+        let known_peers = vec![PeerId::from(2), PeerId::from(3), PeerId::from(4)];
+        let mut consensus = VotingConsensus::new(PeerId::from(1), &known_peers);
+
+        assert_eq!(
+            consensus.make_vote(PeerId::from(2), false),
+            ConsensusOutcome::Rejected
+        );
+        assert_eq!(
+            consensus.make_vote(PeerId::from(3), true),
+            ConsensusOutcome::Rejected
+        );
+    }
+}

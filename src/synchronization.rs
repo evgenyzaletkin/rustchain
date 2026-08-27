@@ -1,6 +1,6 @@
 use crate::network::{NetworkInterface, NetworkMessage};
 use crate::peer::PeerId;
-use crate::storage::{BlockFile, BlockKeeper, BlockStorageState};
+use crate::storage::{BlockFile, BlockStorageState};
 use crate::synchronization::SyncState::{FAIL, SUCCESS};
 use log::{debug, error, trace};
 use rand::Rng;
@@ -9,11 +9,6 @@ use rand::seq::IndexedRandom;
 use std::cmp::min;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::time;
-use tokio::time::Interval;
-
-const SYNC_INTERVAL: Duration = Duration::from_secs(20);
 
 pub enum SyncState {
     SUCCESS,
@@ -59,22 +54,18 @@ impl<N: NetworkInterface> Synchronization<N> {
         }
     }
 
-    pub async fn create_interval(&mut self) -> Interval {
-        time::interval(SYNC_INTERVAL)
-    }
-
+    /// `peer_height` is the caller's current committed height. `apply_block` is handed
+    /// each fetched block in order and must validate it against the local chain (not
+    /// just trust the sync source) before staging and committing it; a fetched block that
+    /// fails to apply is treated the same as a failed fetch and counts toward the retry
+    /// budget.
     pub async fn check_and_retrieve_missing_blocks(
         &mut self,
-        block_keeper: &mut BlockKeeper,
+        peer_height: u32,
+        mut apply_block: impl FnMut(BlockFile) -> Result<(), String>,
     ) -> SyncState {
         debug!("Checking other peers for new blocks");
         let latest_states = self.get_latest_indexes().await;
-
-        let peer_height = block_keeper
-            .get_block_storage_state()
-            .read()
-            .unwrap()
-            .block_height;
         let peers_states = PeersStates::new(latest_states);
 
         debug!(
@@ -98,13 +89,15 @@ impl<N: NetworkInterface> Synchronization<N> {
                 return FAIL;
             }
             if let Some(block_file) = self.get_block_file(idx, &peers_states).await {
-                let block_hash = block_file.hash.clone();
                 debug!("Adding block {} from peer", idx);
-                block_keeper.add_external_block(block_file).unwrap();
-                block_keeper.commit_block(&block_hash).unwrap();
-                debug!("Block {} added and commited", idx);
-                idx += 1;
-                continue;
+                match apply_block(block_file) {
+                    Ok(()) => {
+                        debug!("Block {} added and commited", idx);
+                        idx += 1;
+                        continue;
+                    }
+                    Err(e) => error!("Failed to apply synchronized block {idx}: {e}"),
+                }
             }
             errors_count += 1;
             error!("Failed to get block {idx} from other peers, errors: {errors_count}");
@@ -129,9 +122,7 @@ impl<N: NetworkInterface> Synchronization<N> {
             .filter(|state| state.is_ok())
             .map(|state| state.unwrap())
             .collect();
-        let all_match = results
-            .windows(2)
-            .all(|w| w[0].block_height == w[1].block_height);
+        let all_match = block_states_match(&results);
         trace!("Received block file states from peers: {:?}", results);
         if results.len() == number_of_peers && all_match {
             let random_peer = &peers_to_request[self.rng.random_range(0..number_of_peers)];
@@ -162,5 +153,134 @@ impl<N: NetworkInterface> Synchronization<N> {
             }
         }
         results
+    }
+}
+
+fn block_states_match(states: &[BlockStorageState]) -> bool {
+    states.windows(2).all(|w| w[0] == w[1])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::KeyManager;
+    use crate::network::local_network::LocalNetwork;
+    use crate::storage::{BlockHash, BlockKeeper, BlockStatus};
+    use crate::transactions::{AssetType, Metadata, Operation, SignedTransaction, Transaction};
+    use k256::ecdsa::SigningKey;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static TEST_DIR_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    #[test]
+    fn block_states_match_when_height_and_hash_match() {
+        let states = vec![
+            BlockStorageState {
+                block_height: 1,
+                last_commited_hash: BlockHash::new([1; 32]),
+            },
+            BlockStorageState {
+                block_height: 1,
+                last_commited_hash: BlockHash::new([1; 32]),
+            },
+        ];
+
+        assert!(block_states_match(&states));
+    }
+
+    #[test]
+    fn block_states_do_not_match_when_hash_differs_at_same_height() {
+        let states = vec![
+            BlockStorageState {
+                block_height: 1,
+                last_commited_hash: BlockHash::new([1; 32]),
+            },
+            BlockStorageState {
+                block_height: 1,
+                last_commited_hash: BlockHash::new([2; 32]),
+            },
+        ];
+
+        assert!(!block_states_match(&states));
+    }
+
+    #[tokio::test]
+    async fn local_network_retrieves_missing_block() {
+        let (source_dir, target_dir) = create_test_dirs();
+        let mut source_keeper = BlockKeeper::new(source_dir, 1);
+        let mut target_keeper = BlockKeeper::new(target_dir, 1);
+        let client_key = KeyManager::create_key();
+        let block_hash = create_and_commit_block(&mut source_keeper, &client_key);
+
+        let mut network = LocalNetwork::default();
+        network.add_block_storage_view(PeerId::from(2), source_keeper.create_block_storage_view());
+        let network = Arc::new(network);
+        let mut synchronization = Synchronization::new(network);
+
+        let peer_height = target_keeper
+            .get_block_storage_state()
+            .read()
+            .unwrap()
+            .block_height;
+        let result = synchronization
+            .check_and_retrieve_missing_blocks(peer_height, |block_file| {
+                if !target_keeper.block_can_be_added(&block_file) {
+                    return Err(format!(
+                        "block {} does not extend the local chain",
+                        block_file.hash
+                    ));
+                }
+                let block_hash = block_file.hash;
+                target_keeper
+                    .add_external_block(block_file)
+                    .map_err(|e| e.to_string())?;
+                target_keeper.commit_block(&block_hash)
+            })
+            .await;
+
+        assert!(matches!(result, SyncState::SUCCESS));
+        let target_state = target_keeper.get_block_storage_state();
+        let target_state = target_state.read().unwrap();
+        assert_eq!(target_state.block_height, 1);
+        assert_eq!(target_state.last_commited_hash, block_hash);
+    }
+
+    fn create_and_commit_block(
+        block_keeper: &mut BlockKeeper,
+        client_key: &SigningKey,
+    ) -> BlockHash {
+        let transaction = SignedTransaction::new(
+            Transaction {
+                operation: Operation::AddCoin {
+                    amount: 10,
+                    asset_type: AssetType::BTC,
+                },
+                metadata: Metadata {
+                    timestamp_nanos: 100,
+                    sequence_number: 1,
+                },
+            },
+            client_key,
+        );
+        let BlockStatus::NewBlockCreated { block_hash } = block_keeper.add_transaction(transaction)
+        else {
+            panic!("Expected a new block to be created");
+        };
+        block_keeper.commit_block(&block_hash).unwrap();
+        block_hash
+    }
+
+    fn create_test_dirs() -> (PathBuf, PathBuf) {
+        let dir_id = TEST_DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let base_dir = PathBuf::from("target/test/data/synchronization").join(dir_id.to_string());
+        let source_dir = base_dir.join("source");
+        let target_dir = base_dir.join("target");
+        let _ = fs::remove_dir_all(&base_dir);
+        fs::create_dir_all(&source_dir).expect("Failed to create source dir");
+        fs::create_dir_all(&target_dir).expect("Failed to create target dir");
+        (source_dir, target_dir)
     }
 }

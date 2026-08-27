@@ -6,9 +6,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 
+pub mod discovery_client;
 pub mod local_network;
-pub mod rest_network;
 pub mod network_constants;
+pub mod rest_network;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct RegisterRequest {
@@ -37,10 +38,14 @@ pub enum NetworkMessage {
 impl NetworkMessage {
     fn path(&self) -> String {
         match self {
-            NetworkMessage::GetLatestBlockState => network_constants::LATEST_BLOCK_STATE_PATH.to_string(),
+            NetworkMessage::GetLatestBlockState => {
+                network_constants::LATEST_BLOCK_STATE_PATH.to_string()
+            }
             NetworkMessage::GetBlockState(idx) => format!("/block/state/{}", idx),
             NetworkMessage::GetBlock(idx) => format!("/block/{}", idx),
-            NetworkMessage::PeerMessage(_) => network_constants::HANDLE_PEER_MESSAGE_PATH.to_string(),
+            NetworkMessage::PeerMessage(_) => {
+                network_constants::HANDLE_PEER_MESSAGE_PATH.to_string()
+            }
             NetworkMessage::Register(_) => network_constants::REGISTER_PATH.to_string(),
             NetworkMessage::GetPeers => network_constants::GET_PEERS_PATH.to_string(),
         }
@@ -82,7 +87,7 @@ impl From<&HashMap<PeerId, SocketAddr>> for PeersResponse {
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct PeerWithAddr {
     peer_id: PeerId,
     addr: SocketAddr,
@@ -94,6 +99,7 @@ impl PeerWithAddr {
     }
 }
 
+#[allow(async_fn_in_trait)]
 pub trait NetworkInterface: Send + Sync + 'static {
     fn send_peer_message(&self, message: Message);
     fn broadcast_peer_message(&self, message_body: &MessageBody, from: PeerId);
@@ -108,7 +114,7 @@ pub trait NetworkInterface: Send + Sync + 'static {
     async fn send_and_wait_for_all<T: DeserializeOwned>(
         &self,
         _message_body: NetworkMessage,
-        _peers: &Vec<PeerId>,   
+        _peers: &Vec<PeerId>,
     ) -> HashMap<PeerId, Result<T, String>>;
 
     async fn wait_for_readiness(&self);

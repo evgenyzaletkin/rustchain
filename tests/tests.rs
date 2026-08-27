@@ -4,21 +4,23 @@ mod tests {
     use k256::ecdsa::SigningKey;
     use k256::ecdsa::signature::Verifier;
     use k256::ecdsa::{Signature, VerifyingKey};
+    use rustchain::consensus::ConsensusEngine;
     use rustchain::crypto::KeyManager;
     use rustchain::network::local_network::LocalNetwork;
     use rustchain::peer::{Peer, PeerId};
     use rustchain::storage::BlockKeeper;
-    use rustchain::transactions::SignedTransaction;
+    use rustchain::transactions::{
+        SignedTransaction, TransactionProcessor, TransactionValidationError,
+    };
     use std::fs;
     use std::path::PathBuf;
     use std::sync::Arc;
-    use tokio::sync::mpsc;
 
     const TEST_DATA_PATH: &str = "target/test/data";
 
     #[test]
     fn test_key_from_key_manager() {
-        let key_dir = PathBuf::from(TEST_DATA_PATH).join("peer_1");
+        let key_dir = PathBuf::from(TEST_DATA_PATH).join("key_manager_peer");
         recreate_dir(&key_dir);
         let signing_key: SigningKey = KeyManager::get_or_create_key(&key_dir);
 
@@ -80,17 +82,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_block_verification() {
-        let (send1, recv1) = mpsc::channel(1000);
-        let peer_1_dir = PathBuf::from(TEST_DATA_PATH).join("peer_1");
+        let peer_1_dir = PathBuf::from(TEST_DATA_PATH).join("block_verification_peer");
         recreate_dir(&peer_1_dir);
 
         let mut block_keeper = BlockKeeper::new(peer_1_dir.clone(), 1);
-        let peer_1 = Peer::create_with_storage(
+        let network = Arc::new(LocalNetwork::default());
+        let _peer_1 = Peer::new(
             PeerId::new(1),
-            recv1,
-            peer_1_dir.clone(),
+            network.clone(),
+            ConsensusEngine::new_voting(PeerId::new(1)),
             BlockKeeper::new(peer_1_dir.clone(), 1),
-            Arc::new(LocalNetwork::default()),
+            KeyManager::get_or_create_key(&peer_1_dir),
         );
 
         // Create and add a transaction
@@ -138,6 +140,208 @@ mod tests {
 
         // But they should have different tx_ids
         assert_ne!(client_transaction.tx_id(), wrong_transaction.tx_id());
+    }
+
+    #[test]
+    fn test_send_from_missing_account_returns_error() {
+        let mut processor = TransactionProcessor::default();
+        let sender_key = KeyManager::create_key();
+        let sender_id = KeyManager::to_string_hex(&VerifyingKey::from(&sender_key));
+        let send_tx = create_signed_transaction(
+            &sender_key,
+            Operation::Send {
+                recipient: "recipient".to_string(),
+                amount: 10,
+                asset_type: AssetType::BTC,
+            },
+            1,
+        );
+
+        let result = processor.process_transaction(send_tx);
+
+        assert_eq!(
+            result,
+            Err(TransactionValidationError::AccountNotFound {
+                account_id: sender_id
+            })
+        );
+    }
+
+    #[test]
+    fn test_send_with_insufficient_funds_returns_error() {
+        let mut processor = TransactionProcessor::default();
+        let sender_key = KeyManager::create_key();
+        let sender_id = KeyManager::to_string_hex(&VerifyingKey::from(&sender_key));
+        processor
+            .process_transaction(create_signed_transaction(
+                &sender_key,
+                Operation::AddCoin {
+                    amount: 5,
+                    asset_type: AssetType::BTC,
+                },
+                1,
+            ))
+            .unwrap();
+
+        let result = processor.process_transaction(create_signed_transaction(
+            &sender_key,
+            Operation::Send {
+                recipient: "recipient".to_string(),
+                amount: 10,
+                asset_type: AssetType::BTC,
+            },
+            2,
+        ));
+
+        assert_eq!(
+            result,
+            Err(TransactionValidationError::InsufficientFunds {
+                account_id: sender_id.clone(),
+                balance: 5,
+                amount: 10,
+            })
+        );
+        assert_eq!(processor.get_account(&sender_id).unwrap().balance, 5);
+    }
+
+    #[test]
+    fn test_send_with_asset_mismatch_returns_error() {
+        let mut processor = TransactionProcessor::default();
+        let sender_key = KeyManager::create_key();
+        let sender_id = KeyManager::to_string_hex(&VerifyingKey::from(&sender_key));
+        processor
+            .process_transaction(create_signed_transaction(
+                &sender_key,
+                Operation::AddCoin {
+                    amount: 10,
+                    asset_type: AssetType::BTC,
+                },
+                1,
+            ))
+            .unwrap();
+
+        let result = processor.process_transaction(create_signed_transaction(
+            &sender_key,
+            Operation::Send {
+                recipient: "recipient".to_string(),
+                amount: 5,
+                asset_type: AssetType::USDT,
+            },
+            2,
+        ));
+
+        assert_eq!(
+            result,
+            Err(TransactionValidationError::AssetMismatch {
+                account_id: sender_id.clone(),
+                expected: AssetType::BTC,
+                actual: AssetType::USDT,
+            })
+        );
+        assert_eq!(processor.get_account(&sender_id).unwrap().balance, 10);
+    }
+
+    #[test]
+    fn test_process_transaction_is_idempotent_for_the_same_transaction() {
+        let mut processor = TransactionProcessor::default();
+        let sender_key = KeyManager::create_key();
+        let sender_id = KeyManager::to_string_hex(&VerifyingKey::from(&sender_key));
+        let add_coin_tx = create_signed_transaction(
+            &sender_key,
+            Operation::AddCoin {
+                amount: 10,
+                asset_type: AssetType::BTC,
+            },
+            1,
+        );
+
+        processor.process_transaction(add_coin_tx.clone()).unwrap();
+        processor.process_transaction(add_coin_tx).unwrap();
+
+        assert_eq!(processor.get_account(&sender_id).unwrap().balance, 10);
+    }
+
+    #[test]
+    fn test_rollback_transactions_reverses_add_coin() {
+        let mut processor = TransactionProcessor::default();
+        let sender_key = KeyManager::create_key();
+        let sender_id = KeyManager::to_string_hex(&VerifyingKey::from(&sender_key));
+        let add_coin_tx = create_signed_transaction(
+            &sender_key,
+            Operation::AddCoin {
+                amount: 10,
+                asset_type: AssetType::BTC,
+            },
+            1,
+        );
+
+        processor.process_transaction(add_coin_tx.clone()).unwrap();
+        assert_eq!(processor.get_account(&sender_id).unwrap().balance, 10);
+
+        processor.rollback_transactions(&[add_coin_tx.clone()]);
+
+        assert_eq!(processor.get_account(&sender_id).unwrap().balance, 0);
+
+        // The rolled-back transaction is no longer considered applied, so it can be
+        // reprocessed later (e.g. if it gets included in a subsequently committed block).
+        processor.process_transaction(add_coin_tx).unwrap();
+        assert_eq!(processor.get_account(&sender_id).unwrap().balance, 10);
+    }
+
+    #[test]
+    fn test_rollback_transactions_reverses_send_in_reverse_order() {
+        let mut processor = TransactionProcessor::default();
+        let sender_key = KeyManager::create_key();
+        let sender_id = KeyManager::to_string_hex(&VerifyingKey::from(&sender_key));
+        let recipient_key = KeyManager::create_key();
+        let recipient_id = KeyManager::to_string_hex(&VerifyingKey::from(&recipient_key));
+
+        let add_coin_tx = create_signed_transaction(
+            &sender_key,
+            Operation::AddCoin {
+                amount: 20,
+                asset_type: AssetType::BTC,
+            },
+            1,
+        );
+        let send_tx = create_signed_transaction(
+            &sender_key,
+            Operation::Send {
+                recipient: recipient_id.clone(),
+                amount: 15,
+                asset_type: AssetType::BTC,
+            },
+            2,
+        );
+
+        processor.process_transaction(add_coin_tx.clone()).unwrap();
+        processor.process_transaction(send_tx.clone()).unwrap();
+        assert_eq!(processor.get_account(&sender_id).unwrap().balance, 5);
+        assert_eq!(processor.get_account(&recipient_id).unwrap().balance, 15);
+
+        // Simulates rolling back a whole rejected block: transactions are undone in
+        // reverse of the order they were applied.
+        processor.rollback_transactions(&[add_coin_tx, send_tx]);
+
+        assert_eq!(processor.get_account(&sender_id).unwrap().balance, 0);
+        assert_eq!(processor.get_account(&recipient_id).unwrap().balance, 0);
+    }
+
+    fn create_signed_transaction(
+        signing_key: &SigningKey,
+        operation: Operation,
+        sequence_number: u32,
+    ) -> SignedTransaction {
+        SignedTransaction::new(
+            Transaction {
+                operation,
+                metadata: Metadata {
+                    timestamp_nanos: 100,
+                    sequence_number,
+                },
+            },
+            signing_key,
+        )
     }
 
     fn recreate_dir(path: &PathBuf) {

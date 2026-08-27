@@ -2,19 +2,18 @@ use axum::extract::State;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use log::info;
+use rustchain::config::{DISCOVERY_BIND_HOST_ENV_VAR, DISCOVERY_PORT_ENV_VAR};
 use rustchain::logging::init_logging;
 use rustchain::network::{PeersResponse, RegisterRequest, network_constants};
 use rustchain::peer::PeerId;
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 
 const KEEP_ALIVE: Duration = Duration::from_secs(20);
-const DISCOVERY_ENV: &str = "DISCOVERY_PORT";
-
 #[derive(Default)]
 struct AppState {
     known_peers: HashMap<PeerId, (SocketAddr, Instant)>,
@@ -27,12 +26,16 @@ struct DiscoveryConfig {
 }
 impl DiscoveryConfig {
     fn from_env() -> Result<DiscoveryConfig, String> {
-        let port = std::env::var(DISCOVERY_ENV)
+        let port = std::env::var(DISCOVERY_PORT_ENV_VAR)
             .ok()
             .and_then(|p| p.parse().ok())
             .unwrap_or(network_constants::BASE_PORT);
-
-        let listening_addr = SocketAddr::from((network_constants::LOCAL_HOST, port));
+        let bind_host = std::env::var(DISCOVERY_BIND_HOST_ENV_VAR)
+            .unwrap_or_else(|_| IpAddr::from(network_constants::LOCAL_HOST).to_string());
+        let bind_ip: IpAddr = bind_host
+            .parse()
+            .map_err(|_| format!("{DISCOVERY_BIND_HOST_ENV_VAR} must be an IP address"))?;
+        let listening_addr = SocketAddr::from((bind_ip, port));
 
         Ok(Self { listening_addr })
     }
@@ -74,7 +77,8 @@ async fn register_peer(
 
 async fn get_peers(State(shared_state): State<SharedState>) -> String {
     let read_state = shared_state.read().await;
-    let filtered: HashMap<_, _> = read_state.known_peers
+    let filtered: HashMap<_, _> = read_state
+        .known_peers
         .iter()
         .filter(|(_, addr_and_time)| addr_and_time.1.elapsed() < KEEP_ALIVE) // your filter condition here
         .map(|(k, v)| (k.clone(), *v))

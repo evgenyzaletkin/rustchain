@@ -3,6 +3,13 @@ name = "rustchain"
 version = "0.1.0"
 edition = "2024"
 
+[lints.clippy]
+cast_lossless = "deny"
+cast_possible_truncation = "deny"
+cast_possible_wrap = "deny"
+cast_sign_loss = "deny"
+cast_precision_loss = "deny"
+
 [dependencies]
 # Use glommio
 log = { version = "0.4.27", features = ["std"] }

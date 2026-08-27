@@ -1,0 +1,89 @@
+name: rustchain-raft-demo
+
+x-peer: &peer
+  image: rustchain-raft-demo:local
+  build:
+    context: ../..
+    dockerfile: docker/demo/Dockerfile
+  init: true
+  depends_on:
+    - discovery
+  environment: &peer-environment
+    CONSENSUS_MODE: ${CONSENSUS_MODE:-raft}
+    DISCOVERY_HOST: discovery
+    PEER_BIND_HOST: 0.0.0.0
+    MY_LOG_LEVEL: debug
+
+services:
+  discovery:
+    image: rustchain-raft-demo:local
+    build:
+      context: ../..
+      dockerfile: docker/demo/Dockerfile
+    init: true
+    command: ["discovery"]
+    environment:
+      DISCOVERY_BIND_HOST: 0.0.0.0
+      MY_LOG_LEVEL: info
+    ports:
+      - "3000:3000"
+
+  peer1:
+    <<: *peer
+    command: ["peer_runner"]
+    environment:
+      <<: *peer-environment
+      PEER_ID: "1"
+      PEER_ADVERTISE_HOST: peer1
+    ports:
+      - "3001:3001"
+    volumes:
+      - peer1-data:/app/data/peer_1
+      - test-client-data:/app/data/test_clients
+
+  peer2:
+    <<: *peer
+    command: ["peer_runner"]
+    environment:
+      <<: *peer-environment
+      PEER_ID: "2"
+      PEER_ADVERTISE_HOST: peer2
+    ports:
+      - "3002:3002"
+    volumes:
+      - peer2-data:/app/data/peer_2
+      - test-client-data:/app/data/test_clients
+
+  peer3:
+    <<: *peer
+    command: ["peer_runner"]
+    environment:
+      <<: *peer-environment
+      PEER_ID: "3"
+      PEER_ADVERTISE_HOST: peer3
+    ports:
+      - "3003:3003"
+    volumes:
+      - peer3-data:/app/data/peer_3
+      - test-client-data:/app/data/test_clients
+
+  peer4:
+    <<: *peer
+    profiles: ["joiner"]
+    command: ["peer_runner"]
+    environment:
+      <<: *peer-environment
+      PEER_ID: "4"
+      PEER_ADVERTISE_HOST: peer4
+    ports:
+      - "3004:3004"
+    volumes:
+      - peer4-data:/app/data/peer_4
+      - test-client-data:/app/data/test_clients
+
+volumes:
+  peer1-data:
+  peer2-data:
+  peer3-data:
+  peer4-data:
+  test-client-data:
